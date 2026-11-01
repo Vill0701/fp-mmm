@@ -120,6 +120,7 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--primary); o
   margin: 12px 0;
 }
 .upload input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.upload.compact { padding: 14px 12px; margin: 8px 0; }
 .upload span { color: var(--muted); font-size: 0.9rem; }
 .upload:focus-within { outline: 2px solid var(--primary); outline-offset: 2px; }
 

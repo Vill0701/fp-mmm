@@ -1,7 +1,11 @@
-// CSV sederhana (RFC 4180): pemisah koma; nilai yang berisi koma, kutip, atau baris baru diberi tanda kutip.
-// Dipakai untuk file data master di repo private, supaya tampil sebagai tabel di GitHub.
+// CSV sederhana (RFC 4180): nilai yang berisi pemisah, kutip, atau baris baru diberi tanda kutip.
+// Dipakai untuk file data master di repo private (supaya tampil sebagai tabel di GitHub) dan untuk impor.
 
-export function parseCsv(text) {
+/**
+ * Pecah teks menjadi baris-baris berisi sel, dengan pemisah tertentu (koma, titik koma, atau tab).
+ * Tanda kutip hanya membuka nilai berkutip di awal sel, kecuali `lenientQuotes` (untuk file yang tidak standar).
+ */
+export function parseDelimited(text, delimiter = ",", { lenientQuotes = false } = {}) {
   const rows = [];
   let row = [];
   let cell = "";
@@ -12,23 +16,33 @@ export function parseCsv(text) {
       if (c !== '"') cell += c;
       else if (text[i + 1] === '"') cell += text[i++];
       else quoted = false;
-    } else if (c === '"') quoted = true;
-    else if (c === ",") {
+    } else if (c === '"' && (cell === "" || lenientQuotes)) quoted = true;
+    else if (c === delimiter) {
       row.push(cell);
       cell = "";
     } else if (c === "\n" || c === "\r") {
       if (c === "\r" && text[i + 1] === "\n") i++;
-      row.push(cell);
-      rows.push(row);
+      rows.push([...row, cell]);
       row = [];
       cell = "";
     } else cell += c;
   }
   if (cell !== "" || row.length) rows.push([...row, cell]);
+  return rows;
+}
 
-  const [header = [], ...body] = rows.filter((r) => r.some((c) => c.trim() !== ""));
+export function parseCsv(text) {
+  const [header = [], ...body] = parseDelimited(text).filter((r) => r.some((c) => c.trim() !== ""));
   const keys = header.map((k) => k.replace(/^﻿/, "").trim());
   return body.map((r) => Object.fromEntries(keys.map((k, i) => [k, (r[i] ?? "").trim()])));
+}
+
+/** Teks tempelan dari Excel atau isi file CSV/TXT: pemisah dipilih otomatis (tab, titik koma, lalu koma). */
+export function rowsFromText(text) {
+  const clean = text.replace(/^﻿/, "");
+  const sample = clean.split(/\r?\n/, 20).join("\n");
+  const delimiter = ["\t", ";", ","].find((d) => sample.includes(d)) ?? "\t";
+  return parseDelimited(clean, delimiter);
 }
 
 export function toCsv(columns, records) {

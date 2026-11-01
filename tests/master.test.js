@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseCsv, toCsv } from "../src/csv.js";
+import { parseCsv, rowsFromText, toCsv } from "../src/csv.js";
 import * as M from "../src/master.js";
 
 // Data uji buatan, bukan NPWP asli.
@@ -46,19 +46,33 @@ test("data master: baca, ubah, dan tulis ulang", () => {
   assert.deepEqual(again, master);
 });
 
-test("tempel pelanggan dari Excel", () => {
+test("impor pelanggan dari tempelan Excel, ketikan di HP, atau CSV", () => {
   const spaced = npwpA.replace(/(\d{4})/g, "$1 ").trim();
-  const text = [
-    "NPWP\tNama",
-    `${spaced}\t\tCV CONTOH ABADI`,
-    `PT DUA;${npwpB};${npwpB}000001`,
-    "123\tPT SALAH",
-    `${npwpB}`,
-  ].join("\n");
-  const { customers, errors } = M.parsePastedCustomers(text);
-  assert.deepEqual(customers, [
-    { name: "CV CONTOH ABADI", npwp: npwpA, nitku: npwpA + "000000" },
-    { name: "PT DUA", npwp: npwpB, nitku: npwpB + "000001" },
+
+  // Tempelan Excel (tab) dengan judul dan baris judul kolom sebelum data
+  let r = M.parseCustomerRows(rowsFromText(["Daftar pelanggan", "NPWP\tNama", `${spaced}\t\tCV CONTOH ABADI`, "123\tPT SALAH", npwpB].join("\n")));
+  assert.deepEqual(r.customers, [{ name: "CV CONTOH ABADI", npwp: npwpA, nitku: npwpA + "000000" }]);
+  assert.deepEqual(r.errors, ["Baris 4: NPWP 16 digit tidak ditemukan", "Baris 5: nama pelanggan kosong"]);
+
+  // Diketik di HP dengan titik koma, NITKU cabang ikut
+  r = M.parseCustomerRows(rowsFromText(`PT DUA;${npwpB};${npwpB}000001`));
+  assert.deepEqual(r.customers, [{ name: "PT DUA", npwp: npwpB, nitku: npwpB + "000001" }]);
+
+  // CSV berpemisah koma dengan nama bertanda kutip
+  r = M.parseCustomerRows(rowsFromText(`nama,npwp\n"PT TIGA, Tbk.",${npwpA}\n`));
+  assert.deepEqual(r.customers, [{ name: "PT TIGA, Tbk.", npwp: npwpA, nitku: npwpA + "000000" }]);
+});
+
+test("impor barang: kode invoice, kode Coretax, satuan dan nama opsional", () => {
+  const { items, errors } = M.parseItemRows(
+    rowsFromText(
+      ["Kode\tKode Coretax\tNama", "104000\t854400\tKABEL SUPREME", "ITM-06549\t381400\tum.0007\tTHINER", "ITM-1\tBAUT TANPA KODE", 'ITM-07207\t680500\tAMPLAS SUSUN 4" G240'].join("\n"),
+    ),
+  );
+  assert.deepEqual(items, [
+    { code: "104000", coretaxCode: "854400", unit: "", name: "KABEL SUPREME" },
+    { code: "ITM-06549", coretaxCode: "381400", unit: "UM.0007", name: "THINER" },
+    { code: "ITM-07207", coretaxCode: "680500", unit: "", name: 'AMPLAS SUSUN 4" G240' }, // kutip di tengah nama tetap utuh
   ]);
-  assert.deepEqual(errors, ["Baris 4: NPWP 16 digit tidak ditemukan", "Baris 5: nama pelanggan kosong"]);
+  assert.deepEqual(errors, ["Baris 4: kode barang Coretax (6 angka) tidak ditemukan"]);
 });

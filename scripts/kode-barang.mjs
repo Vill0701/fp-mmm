@@ -1,7 +1,7 @@
 // Ubah file referensi DJP "ListOfGoods" menjadi src/kode-barang.js (daftar kode barang untuk pencarian).
 // Jalankan ulang kalau DJP memperbarui daftarnya: npm run kode-barang [-- path/ke/ListOfGoods.txt]
 import { readFileSync, writeFileSync } from "node:fs";
-import { parseCsv } from "../src/csv.js";
+import { parseDelimited } from "../src/csv.js";
 
 const source = process.argv[2] ?? new URL("../contoh/ListOfGoods.txt", import.meta.url);
 
@@ -29,7 +29,8 @@ for (const line of lines) {
   let inner = line.trim();
   if (inner.startsWith('"') && inner.endsWith('"')) inner = inner.slice(1, -1);
   inner = inner.replace(/""/g, '"');
-  const [type, section, chapter, group, english, indonesian] = Object.values(parseCsv(`a,b,c,d,e,f\n${inner}`)[0]);
+  // File DJP memakai tanda kutip di tengah nilai secara tidak standar, jadi dibaca dengan mode longgar.
+  const [type, section, chapter, group, english, indonesian] = parseDelimited(inner, ",", { lenientQuotes: true })[0].map((f) => f.trim());
   if (type !== "A" || ![section, chapter, group].every((part) => /^\d{2}$/.test(part))) {
     throw new Error(`Data tidak dikenali: ${inner.slice(0, 80)}`);
   }

@@ -131,15 +131,18 @@ export function updateItem(master, code, changes, name = "") {
   master.items[code] = { ...current, name: current.name || name, ...changes };
 }
 
+const filled = (cells) => cells.map((c) => String(c ?? "").trim()).filter(Boolean);
+
 /**
- * Baca data pelanggan yang ditempel dari Excel: tiap baris berisi NPWP dan nama (NITKU opsional),
- * dipisah tab atau titik koma. Urutan kolom bebas; baris judul dilewati.
+ * Baca data pelanggan hasil impor (baris dari file Excel/CSV atau tempelan): tiap baris berisi NPWP dan nama,
+ * NITKU opsional, urutan kolom bebas. Baris judul sebelum data pertama dilewati.
  */
-export function parsePastedCustomers(text) {
+export function parseCustomerRows(rows) {
   const customers = [];
   const errors = [];
-  text.split(/\r?\n/).forEach((line, i) => {
-    const cells = line.split(/[\t;]/).map((c) => c.trim()).filter(Boolean);
+  let started = false;
+  rows.forEach((row, i) => {
+    const cells = filled(row);
     if (!cells.length) return;
     let npwp = null;
     let nitku = null;
@@ -152,11 +155,36 @@ export function parsePastedCustomers(text) {
       else names.push(cell);
     }
     if (!npwp) {
-      if (i > 0 || !names.length) errors.push(`Baris ${i + 1}: NPWP 16 digit tidak ditemukan`);
-      return; // baris pertama tanpa NPWP dianggap judul kolom
+      if (started) errors.push(`Baris ${i + 1}: NPWP 16 digit tidak ditemukan`);
+      return;
     }
+    started = true;
     if (!names.length) return errors.push(`Baris ${i + 1}: nama pelanggan kosong`);
     customers.push({ name: names.join(" "), npwp, nitku: nitku ?? npwp + "000000" });
   });
   return { customers, errors };
+}
+
+/**
+ * Baca data barang hasil impor: kolom pertama kode barang seperti di invoice, lalu kode Coretax 6 angka;
+ * satuan Coretax (UM.xxxx) dan nama barang opsional. Baris judul sebelum data pertama dilewati.
+ */
+export function parseItemRows(rows) {
+  const items = [];
+  const errors = [];
+  let started = false;
+  rows.forEach((row, i) => {
+    const [code, ...rest] = filled(row);
+    if (!code) return;
+    const coretaxCode = rest.find((c) => /^\d{6}$/.test(c));
+    if (!coretaxCode) {
+      if (started) errors.push(`Baris ${i + 1}: kode barang Coretax (6 angka) tidak ditemukan`);
+      return;
+    }
+    started = true;
+    const unit = rest.find((c) => /^UM\.\d{4}$/i.test(c))?.toUpperCase() ?? "";
+    const name = rest.filter((c) => c !== coretaxCode && c.toUpperCase() !== unit).join(" ");
+    items.push({ code, coretaxCode, unit, name });
+  });
+  return { items, errors };
 }

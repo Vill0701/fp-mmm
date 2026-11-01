@@ -2,11 +2,13 @@
 // Semua teks dari PDF dan data master dimasukkan sebagai teks biasa (bukan HTML).
 import * as pdfjs from "../vendor/pdfjs/pdf.min.js";
 import { computeFaktur, customerKey } from "../src/calc.js";
+import { rowsFromText } from "../src/csv.js";
 import * as M from "../src/master.js";
 import { parseInvoices } from "../src/parser.js";
 import { extractPages } from "../src/pdf-text.js";
 import { normalizeUnit, TRX_CODES, UNIT_NAMES } from "../src/satuan.js";
 import { fold, guessQuery, searchCodes, words } from "../src/search.js";
+import { readXlsxRows } from "../src/xlsx.js";
 import { buildXml } from "../src/xml.js";
 import { GitHubStore, MemoryStore } from "./storage.js";
 import { seal, unseal, WrongPinError } from "./vault.js";
@@ -831,7 +833,7 @@ function masterView() {
     "main",
     { class: "master" },
     h("nav", { class: "tabs" }, Object.entries(tabs).map(([key, label]) =>
-      h("button", { class: state.tab === key ? "active" : "", onclick: () => { state.tab = key; state.query = ""; render(); } }, label))),
+      h("button", { class: state.tab === key ? "active" : "", onclick: () => { state.tab = key; state.query = ""; state.importErrors = []; render(); } }, label))),
     body,
     codeDatalist(),
   );
@@ -850,30 +852,101 @@ function customersTab() {
   ];
 }
 
-function importCustomersBox() {
-  const area = h("textarea", { rows: 4, placeholder: "NPWP [tab] Nama pelanggan, satu pelanggan per baris" });
+async function readImportFile(file) {
+  if (/\.xls$/i.test(file.name)) throw new Error("file .xls versi lama belum didukung. Simpan dulu sebagai .xlsx atau CSV.");
+  return /\.xlsx$/i.test(file.name) ? readXlsxRows(await file.arrayBuffer()) : rowsFromText(await file.text());
+}
+
+/**
+ * Kotak impor data master: pilih file Excel/CSV (dibaca di perangkat), atau tempel dari Excel.
+ * `apply(rows, fromFile)` menyimpan hasilnya dan mengembalikan { count, errors, label }, atau null kalau dibatalkan.
+ */
+function importBox({ key, open, title, help, placeholder, apply }) {
+  const area = h("textarea", { rows: 4, placeholder });
+  const finish = (rows, fromFile) => {
+    const result = apply(rows, fromFile);
+    if (!result) return;
+    state.importErrors = result.errors;
+    const skipped = result.errors.length ? `, ${result.errors.length} baris dilewati` : "";
+    toast(`${result.count} ${result.label} disimpan${skipped}`, result.count && !skipped ? "ok" : "error");
+    render();
+  };
   return details(
-    "import-customers",
-    state.master.customers.length === 0,
-    "Tambah / impor pelanggan",
-    h("p", { class: "muted" }, "Salin kolom NPWP dan Nama dari Excel, lalu tempel di sini. NITKU boleh ikut sebagai kolom ketiga. Di HP, pisahkan NPWP dan nama dengan titik koma (;). Pelanggan dengan nama yang sama akan diperbarui."),
-    area,
+    key,
+    open,
+    title,
+    h("p", { class: "muted" }, help),
     h(
-      "button",
-      {
-        onclick: () => {
-          const { customers, errors } = M.parsePastedCustomers(area.value);
-          for (const c of customers) M.upsertCustomer(state.master, c);
-          if (customers.length) markDirty("customers");
-          state.importErrors = errors;
-          toast(`${customers.length} pelanggan disimpan${errors.length ? `, ${errors.length} baris dilewati` : ""}`, errors.length ? "error" : "ok");
-          render();
+      "label",
+      { class: "upload compact" },
+      h("input", {
+        type: "file",
+        accept: ".xlsx,.csv,.txt",
+        onchange: async (e) => {
+          const [file] = e.target.files;
+          e.target.value = "";
+          if (!file) return;
+          busy(`Membaca ${file.name}…`);
+          let rows;
+          try {
+            rows = await readImportFile(file);
+          } catch (err) {
+            return toast(`${file.name}: ${err.message}`, "error");
+          } finally {
+            busy();
+          }
+          finish(rows, true);
         },
-      },
-      "Simpan",
+      }),
+      h("strong", {}, "Pilih file Excel / CSV"),
+      h("span", {}, "Sheet pertama dibaca di perangkat ini, tidak di-upload ke mana pun."),
     ),
+    h("p", { class: "muted" }, "Atau salin dari Excel lalu tempel di sini:"),
+    area,
+    h("button", { onclick: () => finish(rowsFromText(area.value), false) }, "Simpan"),
     state.importErrors.length > 0 && h("ul", { class: "checks" }, state.importErrors.map((e) => h("li", { class: "warn" }, e))),
   );
+}
+
+/** Minta konfirmasi sebelum menyimpan hasil impor dari file. */
+function confirmImport(count, label, errors) {
+  if (!count) return true;
+  const skipped = errors.length ? ` (${errors.length} baris dilewati)` : "";
+  return confirm(`Ditemukan ${count} ${label}${skipped}. Simpan ke data master?`);
+}
+
+function importCustomersBox() {
+  return importBox({
+    key: "import-customers",
+    open: state.master.customers.length === 0,
+    title: "Tambah / impor pelanggan",
+    help: "Kolom NPWP dan Nama (NITKU boleh jadi kolom ketiga), urutan kolom bebas, baris judul dilewati otomatis. Pelanggan dengan nama yang sama akan diperbarui. Pastikan kolom NPWP di Excel berformat Text supaya 16 angkanya utuh.",
+    placeholder: "NPWP [tab] Nama pelanggan — di HP bisa diketik: NPWP;Nama",
+    apply: (rows, fromFile) => {
+      const { customers, errors } = M.parseCustomerRows(rows);
+      if (fromFile && !confirmImport(customers.length, "pelanggan", errors)) return null;
+      for (const c of customers) M.upsertCustomer(state.master, c);
+      if (customers.length) markDirty("customers");
+      return { count: customers.length, errors: customers.length || errors.length ? errors : ["Tidak ada baris yang berisi NPWP 16 digit."], label: "pelanggan" };
+    },
+  });
+}
+
+function importItemsBox() {
+  return importBox({
+    key: "import-items",
+    open: false,
+    title: "Impor barang",
+    help: "Kolom pertama kode barang seperti di invoice, lalu kode barang Coretax 6 angka. Satuan Coretax (UM.xxxx) dan nama barang boleh ikut. Barang dengan kode yang sama akan diperbarui.",
+    placeholder: "Kode barang [tab] Kode Coretax [tab] Nama barang",
+    apply: (rows, fromFile) => {
+      const { items, errors } = M.parseItemRows(rows);
+      if (fromFile && !confirmImport(items.length, "barang", errors)) return null;
+      for (const it of items) M.updateItem(state.master, it.code, { coretaxCode: it.coretaxCode, ...(it.unit ? { unit: it.unit } : {}) }, it.name);
+      if (items.length) markDirty("items");
+      return { count: items.length, errors: items.length || errors.length ? errors : ["Tidak ada baris yang berisi kode barang Coretax 6 angka."], label: "barang" };
+    },
+  });
 }
 
 function customerRow(c) {
@@ -921,6 +994,7 @@ function customerRow(c) {
 function itemsTab() {
   return [
     h("p", { class: "muted" }, "Kode barang Coretax dan satuan yang pernah diisi diingat di sini, berdasarkan kode barang di invoice."),
+    importItemsBox(),
     searchBox("Cari kode atau nama barang"),
     listSection(() => {
       const q = state.query.trim().toUpperCase();
