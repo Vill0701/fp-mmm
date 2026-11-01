@@ -6,6 +6,7 @@ import * as M from "../src/master.js";
 import { parseInvoices } from "../src/parser.js";
 import { extractPages } from "../src/pdf-text.js";
 import { normalizeUnit, TRX_CODES, UNIT_NAMES } from "../src/satuan.js";
+import { fold, guessQuery, searchCodes, words } from "../src/search.js";
 import { buildXml } from "../src/xml.js";
 import { GitHubStore, MemoryStore } from "./storage.js";
 import { seal, unseal, WrongPinError } from "./vault.js";
@@ -605,9 +606,90 @@ function lineRow(line, i) {
         "aria-label": `Kode barang Coretax untuk ${line.name}`,
         onchange: (e) => setItemCode(line, e.target.value),
       }),
+      h("button", {
+        type: "button",
+        class: "secondary",
+        "aria-label": `Cari kode barang untuk ${line.name}`,
+        onclick: () => openCodeSearch({ itemName: line.name, onPick: (code) => setItemCode(line, code) }),
+      }, "Cari"),
       unitSelect({ value: line.unit, invalid: !isUnit(line.unit), onChange: (value) => setLineUnit(line, value) }),
     ),
   );
+}
+
+// ---------- pencarian kode barang ----------
+
+let goodsCodes = null;
+
+/** Kode yang pernah dipakai untuk barang yang namanya mengandung semua kata pencarian. */
+function learnedCodes(query) {
+  const terms = words(query);
+  if (!terms.length) return [];
+  const byCode = new Map();
+  for (const it of Object.values(state.master.items)) {
+    if (!isCode(it.coretaxCode) || !terms.every((t) => fold(it.name).includes(t))) continue;
+    if (!byCode.has(it.coretaxCode)) byCode.set(it.coretaxCode, []);
+    byCode.get(it.coretaxCode).push(it.name);
+  }
+  return [...byCode].sort((a, b) => b[1].length - a[1].length).slice(0, 5);
+}
+
+async function openCodeSearch({ itemName, onPick }) {
+  if (!goodsCodes) {
+    busy("Memuat daftar kode barang…");
+    try {
+      goodsCodes = (await import("../src/kode-barang.js")).GOODS_CODES; // dimuat saat pertama kali dibutuhkan
+    } catch (err) {
+      return toast(`Daftar kode barang gagal dimuat: ${err.message}`, "error");
+    } finally {
+      busy();
+    }
+  }
+  const names = new Map(goodsCodes.map(([code, indonesian]) => [code, indonesian]));
+  const input = h("input", { type: "search", value: guessQuery(itemName), placeholder: "Nama barang atau angka kode, mis. baut", "aria-label": "Cari kode barang" });
+  const results = h("div", { class: "results" });
+  const onKey = (e) => e.key === "Escape" && close();
+  const close = () => {
+    dialog.remove();
+    removeEventListener("keydown", onKey);
+  };
+  const option = (code, title, detail) =>
+    h("button", { type: "button", class: "result", onclick: () => { close(); onPick(code); } },
+      h("span", { class: "mono" }, code),
+      h("span", {}, title, detail && h("small", {}, detail)));
+  const update = () => {
+    const used = learnedCodes(input.value);
+    const found = searchCodes(goodsCodes, input.value);
+    results.replaceChildren(
+      ...(used.length
+        ? [h("h4", {}, "Pernah kamu pakai"), ...used.map(([code, items]) =>
+            option(code, names.get(code) ?? "", `untuk ${items.slice(0, 2).join(", ")}${items.length > 2 ? ` dan ${items.length - 2} barang lain` : ""}`))]
+        : []),
+      h("h4", {}, "Daftar kode barang Coretax"),
+      ...(found.length
+        ? found.map(([code, indonesian, english]) => option(code, indonesian, english))
+        : [h("p", { class: "muted" }, input.value.trim() ? "Tidak ada yang cocok. Coba kata lain, atau kata dalam bahasa Inggris." : "Ketik nama barang atau angka kode.")]),
+    );
+  };
+  input.addEventListener("input", update);
+  const dialog = h(
+    "div",
+    { class: "dialog", role: "dialog", "aria-modal": "true", "aria-label": "Cari kode barang", onclick: (e) => e.target === dialog && close() },
+    h(
+      "div",
+      { class: "dialog-box" },
+      h("header", {},
+        h("div", {}, h("strong", {}, "Cari kode barang"), h("small", {}, itemName)),
+        h("button", { type: "button", class: "icon", "aria-label": "Tutup", onclick: close }, "✕")),
+      input,
+      results,
+    ),
+  );
+  addEventListener("keydown", onKey);
+  document.body.append(dialog);
+  update();
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length); // kursor di akhir kata awal, siap ditambah
 }
 
 function setItemCode(line, value) {
@@ -852,6 +934,7 @@ function itemsTab() {
 }
 
 function itemRow(code, it) {
+  const codeInput = h("input", { name: "coretaxCode", value: it.coretaxCode, inputmode: "numeric", maxlength: "6", list: "kode-barang" });
   const form = h(
     "form",
     {
@@ -865,7 +948,16 @@ function itemRow(code, it) {
         render();
       },
     },
-    field("Kode barang Coretax", h("input", { name: "coretaxCode", value: it.coretaxCode, inputmode: "numeric", maxlength: "6", list: "kode-barang" })),
+    field(
+      "Kode barang Coretax",
+      h("div", { class: "code-field" },
+        codeInput,
+        h("button", {
+          type: "button",
+          class: "secondary",
+          onclick: () => openCodeSearch({ itemName: it.name || code, onPick: (picked) => (codeInput.value = picked) }),
+        }, "Cari")),
+    ),
     field("Satuan Coretax", unitSelect({ name: "unit", value: it.unit, emptyLabel: "Ikut padanan satuan invoice" })),
     field("Jenis", h("select", { name: "opt" },
       h("option", { value: "A", selected: it.opt !== "B" }, "A - Barang"),
