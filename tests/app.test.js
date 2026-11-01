@@ -59,3 +59,10 @@ test("baca dan simpan file, termasuk huruf non-ASCII; konflik dilaporkan", async
 
   await assert.rejects(store.write("pelanggan.csv", "nama\n", "sha-lama", "x"), (err) => err instanceof StoreError && err.status === 409);
 });
+
+test("token tanpa izin Contents diberi pesan yang jelas", async () => {
+  const fetch = async () => new Response("{}", { status: 403 });
+  const store = new GitHubStore({ owner: "pemilik", repo: "data", token: "rahasia", fetch });
+  await assert.rejects(store.read("pelanggan.csv"), /Contents: Read and write/);
+  await assert.rejects(store.write("pelanggan.csv", "x", undefined, "x"), /Contents: Read and write/);
+});

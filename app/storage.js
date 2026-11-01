@@ -2,6 +2,8 @@
 // Respons API tidak disimpan di cache browser (cache: "no-store").
 
 const API = "https://api.github.com";
+// Info izin di respons repo menggambarkan akun, bukan token, jadi izin token baru ketahuan saat membaca/menulis isi file.
+const MISSING_PERMISSION = "Token belum diberi izin Contents: Read and write untuk repo data. Buat token baru dengan izin itu.";
 
 export class StoreError extends Error {
   constructor(message, status) {
@@ -72,6 +74,7 @@ export class GitHubStore {
   async read(path) {
     const res = await this.#request(`/contents/${encodeURIComponent(path)}`);
     if (res.status === 404) return null;
+    if (res.status === 403) throw new StoreError(MISSING_PERMISSION, 403);
     if (!res.ok) throw new StoreError(`Gagal membaca ${path} (${res.status}).`, res.status);
     const file = await res.json();
     return { text: fromBase64(file.content), sha: file.sha };
@@ -86,6 +89,7 @@ export class GitHubStore {
     if (res.status === 409 || res.status === 422) {
       throw new StoreError(`${path} sudah diubah dari perangkat lain.`, 409);
     }
+    if (res.status === 403) throw new StoreError(MISSING_PERMISSION, 403);
     if (!res.ok) throw new StoreError(`Gagal menyimpan ${path} (${res.status}).`, res.status);
     return (await res.json()).content.sha;
   }
