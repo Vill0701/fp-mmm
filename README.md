@@ -2,6 +2,8 @@
 
 Aplikasi web untuk mengubah PDF "Sales Invoice" menjadi file XML faktur pajak keluaran yang bisa diimpor ke Coretax. Bisa dipakai dari HP, tablet, atau laptop.
 
+Buka aplikasinya di **https://vill0701.github.io/fp-mmm/** (mode coba tanpa data master: https://vill0701.github.io/fp-mmm/?coba).
+
 ## Cara pakai
 
 1. Pilih satu atau beberapa PDF invoice. PDF dibaca di perangkat, tidak di-upload ke mana pun.
