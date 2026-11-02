@@ -5,10 +5,11 @@ const CACHE = "fp-mmm-v1";
 self.addEventListener("install", () => self.skipWaiting());
 
 self.addEventListener("activate", (event) => {
+  // Aplikasi lain di alamat yang sama (FP BJY) punya cache sendiri; yang dihapus hanya versi lama cache ini.
   event.waitUntil(
     caches
       .keys()
-      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key))))
+      .then((keys) => Promise.all(keys.filter((key) => key.startsWith("fp-mmm-") && key !== CACHE).map((key) => caches.delete(key))))
       .then(() => self.clients.claim()),
   );
 });
