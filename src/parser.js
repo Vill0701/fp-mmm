@@ -36,6 +36,27 @@ export function parseDate(str) {
 
 const sameLine = (a, b) => Math.abs(a.y - b.y) <= TOL;
 
+const DEFAULT_H = 8; // tinggi huruf (pt) kalau tidak diketahui
+
+/**
+ * Kotak (pt, koordinat halaman yang tampak) yang menutupi teks-teks yang dibaca, untuk ditandai saat PDF
+ * ditampilkan di aplikasi: dari atas huruf sampai sedikit di bawah garis dasarnya.
+ */
+function boxOf(...list) {
+  const its = list.filter(Boolean);
+  if (!its.length) return null;
+  const h = (it) => it.h || DEFAULT_H;
+  return {
+    x0: Math.min(...its.map((it) => it.x)),
+    x1: Math.max(...its.map((it) => it.x + it.w)),
+    top: Math.min(...its.map((it) => it.y - 0.85 * h(it))),
+    bottom: Math.max(...its.map((it) => it.y + 0.3 * h(it))),
+  };
+}
+
+const mergeBoxes = (a, b) =>
+  !a || !b ? a ?? b : { x0: Math.min(a.x0, b.x0), x1: Math.max(a.x1, b.x1), top: Math.min(a.top, b.top), bottom: Math.max(a.bottom, b.bottom) };
+
 /** Teks terdekat di kanan label pada baris yang sama, melewati tanda ":". */
 function valueRightOf(items, label, maxX = Infinity) {
   const start = label.x + label.w;
@@ -119,14 +140,15 @@ function parseRows(items, header, bottomY, warnings) {
       cells[col] = cells[col] ? `${cells[col]} ${it.str}` : it.str;
     }
     const filled = Object.keys(cells);
-    if (/^\d+$/.test(cells.no ?? "")) rows.push(makeRow(cells, warnings));
-    else if (filled.length === 1 && cells.name) rows.push({ continuation: cells.name });
+    const box = boxOf(...line.items);
+    if (/^\d+$/.test(cells.no ?? "")) rows.push({ ...makeRow(cells, warnings), box });
+    else if (filled.length === 1 && cells.name) rows.push({ continuation: cells.name, box });
     else if (filled.length) warnings.push(`baris tabel tidak dikenali: "${line.items.map((it) => it.str).join(" ")}"`);
   }
   return rows;
 }
 
-function parseSummary(items) {
+function parseSummary(items, boxes) {
   const summary = {};
   for (const [text, key] of Object.entries(SUMMARY_LABELS)) {
     const label = items.find((it) => it.str === text);
@@ -134,7 +156,10 @@ function parseSummary(items) {
     const value = items
       .filter((it) => it.x > label.x + label.w && Math.abs(it.y - label.y) <= 3 && parseNumber(it.str) != null)
       .sort((a, b) => Math.abs(a.y - label.y) - Math.abs(b.y - label.y))[0];
-    if (value) summary[key] = parseNumber(value.str);
+    if (value) {
+      summary[key] = parseNumber(value.str);
+      boxes[key] = boxOf(label, value);
+    }
   }
   return Object.keys(summary).length ? summary : null;
 }
@@ -151,37 +176,57 @@ function parsePage(page) {
   const buyerLabel = find("Kepada");
   const contactLabel = find("Kontak");
   const poLabel = find("No Po");
+  // Posisi teks kop yang dibaca, untuk ditandai saat PDF ditampilkan di aplikasi
+  const marks = {};
 
-  const dateText = dateLabel && valueRightOf(items, dateLabel)?.str;
+  const numberValue = numberLabel && valueRightOf(items, numberLabel);
+  marks.number = numberLabel && boxOf(numberLabel, numberValue);
+
+  const dateValue = dateLabel && valueRightOf(items, dateLabel);
+  const dateText = dateValue?.str;
   const date = dateText ? parseDate(dateText) : null;
   if (dateText && !date) warnings.push(`tanggal tidak terbaca: "${dateText}"`);
+  marks.date = dateLabel && boxOf(dateLabel, dateValue);
 
   let buyerName = "";
   const buyerFirst = buyerLabel && valueRightOf(items, buyerLabel, rightBlockX);
   if (buyerFirst) {
     const untilY = contactLabel?.y ?? header?.y ?? Infinity;
-    buyerName = [buyerFirst, ...linesBelow(items, buyerFirst, untilY)].map((it) => it.str).join(" ");
+    const buyerItems = [buyerFirst, ...linesBelow(items, buyerFirst, untilY)];
+    buyerName = buyerItems.map((it) => it.str).join(" ");
+    marks.buyer = boxOf(buyerLabel, ...buyerItems);
   }
+
+  const contactValue = contactLabel && valueRightOf(items, contactLabel, rightBlockX);
+  marks.contact = contactLabel && boxOf(contactLabel, contactValue);
 
   let poNumber = "";
   const poFirst = poLabel && valueRightOf(items, poLabel);
   if (poFirst) {
     const untilY = header?.y ?? poFirst.y + 30;
-    poNumber = joinWrapped([poFirst, ...linesBelow(items, poFirst, untilY)].map((it) => it.str));
+    const poItems = [poFirst, ...linesBelow(items, poFirst, untilY)];
+    poNumber = joinWrapped(poItems.map((it) => it.str));
+    marks.po = boxOf(poLabel, ...poItems);
   }
 
-  const pageInfo = items.map((it) => /^Halaman\s+(\d+)\s+dari\s+(\d+)$/i.exec(it.str)).find(Boolean);
+  const pageItem = items.find((it) => /^Halaman\s+(\d+)\s+dari\s+(\d+)$/i.test(it.str));
+  const pageInfo = pageItem && /^Halaman\s+(\d+)\s+dari\s+(\d+)$/i.exec(pageItem.str);
+  marks.page = boxOf(pageItem);
   const summaryTop = find("Sub Total")?.y ?? Infinity;
+  const summaryMarks = {};
 
   return {
-    number: (numberLabel && valueRightOf(items, numberLabel)?.str) || "",
+    number: numberValue?.str || "",
     date,
     buyerName,
-    contact: (contactLabel && valueRightOf(items, contactLabel, rightBlockX)?.str) || "",
+    contact: contactValue?.str || "",
     poNumber,
     page: pageInfo ? { index: Number(pageInfo[1]), of: Number(pageInfo[2]) } : null,
+    pdfPage: page.number, // nomor halaman di file PDF (beda dengan "Halaman X dari Y" yang tercetak)
     rows: header ? parseRows(items, header, summaryTop, warnings) : [],
-    summary: parseSummary(items),
+    summary: parseSummary(items, summaryMarks),
+    marks,
+    summaryMarks,
     warnings,
   };
 }
@@ -207,6 +252,10 @@ export function parseInvoices(pages) {
   for (const [number, parts] of groups) {
     parts.sort((a, b) => (a.page?.index ?? 0) - (b.page?.index ?? 0));
     const first = parts[0];
+    // Kotak teks yang dibaca: { page (halaman PDF), kind: header | line | summary, key/label, x0, x1, top, bottom } dalam pt
+    const marks = [];
+    const mark = (page, kind, box, extra) => box && marks.push({ page, kind, ...extra, ...box });
+    for (const key of ["date", "buyer", "contact", "po"]) mark(first.pdfPage, "header", first.marks[key], { key }); // dari halaman pertama
     const invoice = {
       number,
       date: first.date,
@@ -214,19 +263,34 @@ export function parseInvoices(pages) {
       contact: first.contact,
       poNumber: first.poNumber,
       pages: [],
+      pdfPages: [],
       lines: [],
       summary: null,
       warnings: [],
+      marks,
     };
     for (const part of parts) {
       const where = `Hal. ${part.page?.index ?? "?"}`;
       if (part.page) invoice.pages.push(part.page);
-      for (const row of part.rows) {
-        if (!row.continuation) invoice.lines.push(row);
-        else if (invoice.lines.length) invoice.lines.at(-1).name += ` ${row.continuation}`;
-        else invoice.warnings.push(`${where}: lanjutan nama barang tanpa baris sebelumnya: "${row.continuation}"`);
+      invoice.pdfPages.push(part.pdfPage);
+      mark(part.pdfPage, "header", part.marks.number, { key: "number" });
+      mark(part.pdfPage, "header", part.marks.page, { key: "page" });
+      for (const { box, ...row } of part.rows) {
+        if (!row.continuation) {
+          invoice.lines.push(row);
+          mark(part.pdfPage, "line", box, { label: String(invoice.lines.length) });
+        } else if (invoice.lines.length) {
+          invoice.lines.at(-1).name += ` ${row.continuation}`;
+          // Lanjutan nama di halaman yang sama ikut kotak barisnya; di halaman lain diberi tanda bernomor sama
+          const last = marks.findLast((m) => m.kind === "line");
+          if (last?.page === part.pdfPage) Object.assign(last, mergeBoxes(last, box));
+          else mark(part.pdfPage, "line", box, { label: String(invoice.lines.length) });
+        } else invoice.warnings.push(`${where}: lanjutan nama barang tanpa baris sebelumnya: "${row.continuation}"`);
       }
-      if (part.summary) invoice.summary = part.summary;
+      if (part.summary) {
+        invoice.summary = part.summary;
+        for (const [key, box] of Object.entries(part.summaryMarks)) mark(part.pdfPage, "summary", box, { key });
+      }
       invoice.warnings.push(...part.warnings.map((w) => `${where}: ${w}`));
     }
     for (const line of invoice.lines) line.name = line.name.replace(/\s+/g, " ").trim();

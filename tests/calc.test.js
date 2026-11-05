@@ -106,6 +106,24 @@ test("biaya kirim menjadi baris faktur tersendiri", () => {
   assert.equal(f.totals.vatSen / 100, 12100);
 });
 
+test("total faktur dibandingkan dengan invoice untuk rekap, dibulatkan ke rupiah", () => {
+  // Harga belum termasuk PPN, dengan diskon: DPP = Sub Total − Diskon, PPN = PPN invoice
+  const f = computeFaktur(invoice([["A1", 10, "PCS", 10000, 90000, "10"], ["B2", 2, "KLG", 50000]], { subTotal: 190000, discount: 19000, ppn: 18810, total: 189810 }), master);
+  assert.equal(f.totals.discountSen, 2900000);
+  assert.deepEqual(f.compared, [
+    { label: "DPP", sen: 17100000, want: 171000, diff: 0 },
+    { label: "PPN", sen: 1881000, want: 18810, diff: 0 },
+  ]);
+  // PPN invoice belum termasuk biaya kirim: PPN faktur = PPN invoice + PPN biaya kirim
+  const ship = computeFaktur(invoice([["A1", 1, "PCS", 100000]], { subTotal: 100000, shipping: 10000, ppn: 11000, total: 121000 }), master);
+  assert.deepEqual(ship.compared.map((c) => [c.label, c.want, c.diff]), [["DPP", 110000, 0], ["PPN", 12100, 0]]);
+  // Harga termasuk PPN: DPP tidak tercetak di invoice, jadi hanya PPN yang dibandingkan
+  const incl = computeFaktur(invoice([["A1", 2, "PCS", 111000], ["B2", 1, "KLG", 55500]], { subTotal: 277500, ppn: 27500, total: 277500 }), master);
+  assert.deepEqual(incl.compared.map((c) => [c.label, c.want, c.diff]), [["PPN", 27500, 0]]);
+  // Rumus PPN tidak dikenali: tidak ada yang dibandingkan
+  assert.deepEqual(computeFaktur(invoice([["A1", 1, "PCS", 100000]], { subTotal: 100000, ppn: 5000, total: 105000 }), master).compared, []);
+});
+
 test("PPN yang tidak cocok dengan rumus mana pun ditandai", () => {
   const f = computeFaktur(invoice([["A1", 1, "PCS", 100000]], { subTotal: 100000, ppn: 5000, total: 105000 }), master);
   assert.equal(f.vatMode.mode, "unknown");

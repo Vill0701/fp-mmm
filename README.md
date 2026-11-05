@@ -7,9 +7,10 @@ Buka aplikasinya di **https://vill0701.github.io/fp-mmm/** (mode coba tanpa data
 ## Cara pakai
 
 1. Pilih satu atau beberapa PDF invoice. PDF dibaca di perangkat, tidak di-upload ke mana pun.
-2. Aplikasi memeriksa setiap invoice: halaman lengkap, jumlah baris sama dengan Sub Total, harga sudah atau belum termasuk PPN, dan PPN faktur sama dengan PPN invoice.
+2. Aplikasi memeriksa setiap invoice: halaman lengkap, jumlah baris sama dengan Sub Total, harga sudah atau belum termasuk PPN, dan PPN faktur sama dengan PPN invoice. Tombol **Lihat PDF** menampilkan halaman invoice asli (semua halamannya) di samping yang dibaca aplikasi; bagian yang dibaca diberi tanda kuning dan baris barang bernomor, jadi baris yang tidak terbaca kelihatan karena tidak bertanda.
 3. Lengkapi yang kurang (NPWP pembeli, kode barang, satuan). Isian diingat untuk invoice berikutnya.
-4. Download XML, lalu impor di Coretax.
+4. Cek **Rekap XML** di bawah daftar: Referensi, Nama Pembeli, Harga Jual, DPP Nilai Lain, dan PPN tiap faktur, dibulatkan ke rupiah seperti di daftar faktur Coretax, dengan ✓ kalau sama dengan invoice. Rekap bisa disalin untuk ditempel di Excel.
+5. Download XML, lalu impor di Coretax. Cocokkan daftar faktur di Coretax dengan rekap lewat nomor Referensi. Nama pembeli di Coretax diisi dari NPWP di data master, jadi nama yang berbeda berarti NPWP pelanggan itu perlu dicek.
 
 ## Data
 

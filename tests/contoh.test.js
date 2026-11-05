@@ -84,3 +84,23 @@ test("isi PDF contoh terbaca sesuai nilai yang sudah diperiksa", { skip }, async
     assert.equal(f.ready, false, "tanpa data master, faktur belum boleh siap");
   }
 });
+
+test("tanda bagian yang dibaca ada di halaman PDF yang benar, satu nomor per baris barang", { skip }, async () => {
+  for (const want of expectations.invoices) {
+    const inv = (await readPdf(want.pdf)).invoices.find((i) => i.number === want.number);
+    const lines = inv.marks.filter((m) => m.kind === "line");
+    assert.deepEqual([...new Set(lines.map((m) => m.label))], inv.lines.map((_, i) => String(i + 1)), want.number);
+    assert.deepEqual(inv.marks.filter((m) => m.kind === "summary").map((m) => m.key).sort(), Object.keys(inv.summary).sort(), want.number);
+    // Nomor invoice dan "Halaman X dari Y" dibaca di setiap halaman; data kop lainnya dari halaman pertama
+    for (const key of ["number", "page"]) assert.deepEqual(inv.marks.filter((m) => m.key === key).map((m) => m.page), inv.pdfPages, `${want.number}: ${key}`);
+    assert.ok(inv.marks.some((m) => m.key === "buyer" && m.page === inv.pdfPages[0]), `${want.number}: Kepada`);
+    for (const m of inv.marks) {
+      assert.ok(inv.pdfPages.includes(m.page), `${want.number}: halaman ${m.page}`);
+      // Halaman invoice diputar, tampak mendatar 621 × 394 pt
+      assert.ok(m.x0 >= 0 && m.x1 <= 622 && m.top >= 0 && m.bottom <= 395 && m.x0 < m.x1 && m.top < m.bottom, `${want.number}: ${JSON.stringify(m)}`);
+    }
+    for (let i = 1; i < lines.length; i++) {
+      if (lines[i].page === lines[i - 1].page) assert.ok(lines[i - 1].bottom <= lines[i].top + 0.5, `${want.number}: baris ${lines[i - 1].label} dan ${lines[i].label} bertumpuk`);
+    }
+  }
+});

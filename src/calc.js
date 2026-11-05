@@ -165,17 +165,25 @@ export function computeFaktur(invoice, master, settings = {}) {
   });
 
   const totals = {
+    discountSen: lines.reduce((a, l) => a + l.discountSen, 0),
     taxBaseSen: lines.reduce((a, l) => a + l.taxBaseSen, 0),
     otherTaxBaseSen: lines.reduce((a, l) => a + l.otherTaxBaseSen, 0),
     vatSen: lines.reduce((a, l) => a + l.vatSen, 0),
   };
 
-  // 6. Hasil faktur dicocokkan lagi dengan invoice
+  // 6. Hasil faktur dicocokkan lagi dengan invoice. `compared` dipakai rekap: total faktur dan angka invoice,
+  //    dibulatkan ke rupiah seperti di daftar faktur Coretax.
+  const compared = [];
+  const compare = (label, sen, wantSen) => {
+    const want = Math.round(wantSen / 100);
+    compared.push({ label, sen, want, diff: Math.round(sen / 100) - want });
+  };
   if (vat.mode === "exclusive") {
     const expectedBase = toSen(sum.subTotal - sum.discount + sum.shipping);
     if (totals.taxBaseSen !== expectedBase) {
       check("error", `Total DPP faktur (${rupiah(totals.taxBaseSen)}) tidak sama dengan invoice (${rupiah(expectedBase)})`);
     }
+    compare("DPP", totals.taxBaseSen, expectedBase);
   }
   if (vat.mode !== "unknown") {
     const shippingLine = sum.shipping ? lines.at(-1) : null;
@@ -184,6 +192,7 @@ export function computeFaktur(invoice, master, settings = {}) {
     if (diff === 0) check("ok", `PPN faktur sama dengan invoice (${rupiah(totals.vatSen)})`);
     else if (Math.abs(diff) <= tolerance) check("info", `PPN faktur ${rupiah(totals.vatSen)}, selisih pembulatan ${rupiah(diff)} dari invoice`);
     else check("warn", `PPN faktur ${rupiah(totals.vatSen)} berbeda ${rupiah(diff)} dari invoice (${rupiah(expectedVat)})`);
+    compare("PPN", totals.vatSen, expectedVat);
   }
 
   // 7. Data master: pembeli, kode barang, satuan
@@ -208,6 +217,7 @@ export function computeFaktur(invoice, master, settings = {}) {
     vatMode: vat,
     lines,
     totals,
+    compared, // total faktur dibandingkan dengan invoice, untuk rekap
     checks,
     ready: !checks.some((c) => c.level === "error"),
   };
