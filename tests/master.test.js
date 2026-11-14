@@ -76,3 +76,20 @@ test("impor barang: kode invoice, kode Coretax, satuan dan nama opsional", () =>
   ]);
   assert.deepEqual(errors, ["Baris 4: kode barang Coretax (6 angka) tidak ditemukan"]);
 });
+
+test("riwayat menyimpan angka rekap per file XML; riwayat lama tanpa angka tetap terbaca", () => {
+  const old = ["nomor,tanggal_invoice,pembeli,diekspor,file", "SI.1,2026-10-01,PT LAMA,2026-10-02 09:00,lama.xml", ""].join(String.fromCharCode(10));
+  const master = M.parseMaster({ history: old });
+  assert.deepEqual(master.history, [{ number: "SI.1", invoiceDate: "2026-10-01", buyer: "PT LAMA", exportedAt: "2026-10-02 09:00", file: "lama.xml", batch: undefined, discountSen: undefined, taxBaseSen: undefined, otherTaxBaseSen: undefined, vatSen: undefined }]);
+  master.history.push({ number: "SI.2", invoiceDate: "2026-11-01", buyer: "PT BARU", exportedAt: "2026-11-02 10:00", file: "baru.xml", batch: "1762000000000", discountSen: 0, taxBaseSen: 100000000, otherTaxBaseSen: 91666667, vatSen: 11000000 });
+  const again = M.parseMaster({ history: M.serializeMaster(master, "history") });
+  assert.deepEqual(again.history, master.history);
+});
+
+test("invoice yang sudah pernah dibuatkan XML dikenali, kecuali daftar yang sama baru saja di-download", () => {
+  const history = [{ number: "SI.1", file: "a.xml" }, { number: "SI.2", file: "a.xml" }, { number: "SI.1", file: "b.xml" }];
+  assert.deepEqual(M.exportStatus(history, ["SI.3"]), {});
+  assert.equal(M.exportStatus(history, ["SI.1", "SI.3"])["SI.1"].previous.file, "b.xml");
+  assert.deepEqual(Object.values(M.exportStatus(history, ["SI.2", "SI.1"], { numbers: ["SI.1", "SI.2"] })).map((x) => x.state), ["done", "done"]);
+  assert.deepEqual(Object.values(M.exportStatus(history, ["SI.1", "SI.2", "SI.3"], { numbers: ["SI.1", "SI.2"] })).map((x) => x.state), ["previous", "previous"]);
+});

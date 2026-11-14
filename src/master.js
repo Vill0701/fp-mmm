@@ -16,8 +16,11 @@ const COLUMNS = {
   customers: ["nama", "npwp", "nitku", "kode_transaksi"],
   items: ["kode", "nama", "kode_coretax", "satuan", "opt"],
   units: ["sat", "satuan_coretax"],
-  history: ["nomor", "tanggal_invoice", "pembeli", "diekspor", "file"],
+  // Angka rekap dalam sen; kelompok = satu file XML. Baris lama (sebelum ada rekap) kolom tambahannya kosong.
+  history: ["nomor", "tanggal_invoice", "pembeli", "diekspor", "file", "kelompok", "potongan_sen", "dpp_sen", "dpp_nilai_lain_sen", "ppn_sen"],
 };
+
+const senOrNone = (text) => (text == null || text === "" || !Number.isFinite(Number(text)) ? undefined : Number(text));
 
 export const DEFAULT_MASTER_SETTINGS = {
   npwpPenjual: "",
@@ -73,9 +76,30 @@ export function parseMaster(texts) {
     buyer: r.pembeli,
     exportedAt: r.diekspor,
     file: r.file,
+    batch: r.kelompok || undefined,
+    discountSen: senOrNone(r.potongan_sen),
+    taxBaseSen: senOrNone(r.dpp_sen),
+    otherTaxBaseSen: senOrNone(r.dpp_nilai_lain_sen),
+    vatSen: senOrNone(r.ppn_sen),
   }));
 
   return { customers, items, units, settings, history };
+}
+
+/**
+ * Invoice di daftar yang sudah pernah dibuatkan XML, supaya faktur tidak terbit dua kali di Coretax.
+ * - "done": daftar ini sama dengan XML yang baru saja di-download (lastExport); boleh di-download ulang dengan konfirmasi.
+ * - "previous": pernah dibuatkan XML sebelumnya; harus dipilih dulu: hapus dari daftar, atau tetap buat lagi.
+ * Invoice yang belum pernah dibuatkan XML tidak dicantumkan. `previous` = riwayat terakhir invoice itu.
+ */
+export function exportStatus(history, numbers, lastExport = null) {
+  const sameList = Boolean(lastExport) && numbers.length === lastExport.numbers.length && numbers.every((n) => lastExport.numbers.includes(n));
+  const status = {};
+  for (const number of numbers) {
+    const previous = history.filter((r) => r.number === number).at(-1);
+    if (previous) status[number] = { state: sameList ? "done" : "previous", previous };
+  }
+  return status;
 }
 
 export function serializeMaster(master, key) {
@@ -107,7 +131,10 @@ export function serializeMaster(master, key) {
     case "history":
       return toCsv(
         COLUMNS.history,
-        master.history.map((h) => ({ nomor: h.number, tanggal_invoice: h.invoiceDate, pembeli: h.buyer, diekspor: h.exportedAt, file: h.file })),
+        master.history.map((h) => ({
+          nomor: h.number, tanggal_invoice: h.invoiceDate, pembeli: h.buyer, diekspor: h.exportedAt, file: h.file, kelompok: h.batch,
+          potongan_sen: h.discountSen, dpp_sen: h.taxBaseSen, dpp_nilai_lain_sen: h.otherTaxBaseSen, ppn_sen: h.vatSen,
+        })),
       );
     default:
       throw new Error(`Data master tidak dikenal: ${key}`);

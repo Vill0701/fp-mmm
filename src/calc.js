@@ -76,7 +76,12 @@ function discountColumnMatches(line, lineDiscSen) {
 export function computeFaktur(invoice, master, settings = {}) {
   const s = { ...DEFAULT_SETTINGS, ...settings };
   const checks = [];
-  const check = (level, message) => checks.push({ level, message });
+  // Bagian invoice yang bermasalah, untuk diberi tanda merah di Lihat PDF: indeks baris, kunci ringkasan, kunci kop
+  const flags = { lines: new Set(), summary: new Set(), header: new Set() };
+  const check = (level, message, flag) => {
+    checks.push({ level, message });
+    for (const [kind, value] of Object.entries(flag ?? {})) flags[kind].add(value);
+  };
   const sum = { subTotal: 0, discount: 0, ppn: 0, shipping: 0, total: 0, ...invoice.summary };
   const tolerance = Math.max(1, Math.ceil(invoice.lines.length / 2)) * 100; // sen
 
@@ -99,17 +104,18 @@ export function computeFaktur(invoice, master, settings = {}) {
   }
   const linesTotal = invoice.lines.reduce((a, l) => a + toSen(l.total ?? 0), 0);
   if (linesTotal !== toSen(sum.subTotal)) {
-    check("error", `Jumlah semua baris (${rupiah(linesTotal)}) tidak sama dengan Sub Total (${rupiah(toSen(sum.subTotal))})`);
+    check("error", `Jumlah semua baris (${rupiah(linesTotal)}) tidak sama dengan Sub Total (${rupiah(toSen(sum.subTotal))})`, { summary: "subTotal" });
   } else {
     check("ok", `Jumlah ${invoice.lines.length} baris barang sama dengan Sub Total`);
   }
 
   // 3. Diskon per baris
-  for (const l of invoice.lines) {
+  for (const [i, l] of invoice.lines.entries()) {
+    if (l.qty == null || l.price == null || l.total == null) flags.lines.add(i);
     const lineDisc = Math.round(l.qty * l.price * 100) - toSen(l.total);
-    if (lineDisc < 0) check("error", `Baris ${l.no}: Total Harga lebih besar dari Qty × @Harga`);
+    if (lineDisc < 0) check("error", `Baris ${l.no}: Total Harga lebih besar dari Qty × @Harga`, { lines: i });
     else if (!discountColumnMatches(l, lineDisc)) {
-      check("warn", `Baris ${l.no}: kolom Disc (${l.disc || "kosong"}) tidak cocok dengan selisih harga (${rupiah(lineDisc)})`);
+      check("warn", `Baris ${l.no}: kolom Disc (${l.disc || "kosong"}) tidak cocok dengan selisih harga (${rupiah(lineDisc)})`, { lines: i });
     }
   }
 
@@ -118,14 +124,14 @@ export function computeFaktur(invoice, master, settings = {}) {
   const inclusive = vat.mode === "inclusive";
   if (vat.mode === "exclusive") check("ok", "Harga belum termasuk PPN (PPN invoice = 12% × 11/12 × DPP)");
   else if (inclusive) check("info", "Harga di invoice sudah termasuk PPN: harga jual dihitung dengan membagi 1,11");
-  else check("error", "PPN di invoice tidak cocok dengan rumus harga belum maupun sudah termasuk PPN, perlu dicek manual");
+  else check("error", "PPN di invoice tidak cocok dengan rumus harga belum maupun sudah termasuk PPN, perlu dicek manual", { summary: "ppn" });
   if (sum.shipping && vat.mode !== "unknown") {
     check("info", vat.withShipping ? "PPN di invoice sudah termasuk biaya kirim" : "PPN di invoice belum termasuk biaya kirim");
   }
 
   const expectedTotal = sum.subTotal - sum.discount + sum.shipping + (inclusive ? 0 : sum.ppn);
   if (invoice.summary && Math.abs(expectedTotal - sum.total) > 1) {
-    check("warn", `Total invoice (${rupiah(toSen(sum.total))}) tidak sama dengan perhitungan (${rupiah(toSen(expectedTotal))})`);
+    check("warn", `Total invoice (${rupiah(toSen(sum.total))}) tidak sama dengan perhitungan (${rupiah(toSen(expectedTotal))})`, { summary: "total" });
   }
 
   // 5. Baris faktur
@@ -181,7 +187,7 @@ export function computeFaktur(invoice, master, settings = {}) {
   if (vat.mode === "exclusive") {
     const expectedBase = toSen(sum.subTotal - sum.discount + sum.shipping);
     if (totals.taxBaseSen !== expectedBase) {
-      check("error", `Total DPP faktur (${rupiah(totals.taxBaseSen)}) tidak sama dengan invoice (${rupiah(expectedBase)})`);
+      check("error", `Total DPP faktur (${rupiah(totals.taxBaseSen)}) tidak sama dengan invoice (${rupiah(expectedBase)})`, { summary: "subTotal" });
     }
     compare("DPP", totals.taxBaseSen, expectedBase);
   }
@@ -191,13 +197,13 @@ export function computeFaktur(invoice, master, settings = {}) {
     const diff = totals.vatSen - expectedVat;
     if (diff === 0) check("ok", `PPN faktur sama dengan invoice (${rupiah(totals.vatSen)})`);
     else if (Math.abs(diff) <= tolerance) check("info", `PPN faktur ${rupiah(totals.vatSen)}, selisih pembulatan ${rupiah(diff)} dari invoice`);
-    else check("warn", `PPN faktur ${rupiah(totals.vatSen)} berbeda ${rupiah(diff)} dari invoice (${rupiah(expectedVat)})`);
+    else check("warn", `PPN faktur ${rupiah(totals.vatSen)} berbeda ${rupiah(diff)} dari invoice (${rupiah(expectedVat)})`, { summary: "ppn" });
     compare("PPN", totals.vatSen, expectedVat);
   }
 
   // 7. Data master: pembeli, kode barang, satuan
   const customer = findCustomer(master.customers ?? [], invoice.buyerName);
-  if (!customer) check("error", `Pembeli "${invoice.buyerName}" belum ada di data master`);
+  if (!customer) check("error", `Pembeli "${invoice.buyerName}" belum ada di data master`, { header: "buyer" });
   else {
     if (!/^\d{16}$/.test(customer.npwp)) check("error", "NPWP pembeli di data master harus 16 digit");
     if (!/^\d{22}$/.test(customer.nitku)) check("error", "NITKU pembeli di data master harus 22 digit");
@@ -219,6 +225,7 @@ export function computeFaktur(invoice, master, settings = {}) {
     totals,
     compared, // total faktur dibandingkan dengan invoice, untuk rekap
     checks,
+    flags: { lines: [...flags.lines], summary: [...flags.summary], header: [...flags.header] },
     ready: !checks.some((c) => c.level === "error"),
   };
 }

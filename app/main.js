@@ -2,6 +2,7 @@
 // Semua teks dari PDF dan data master dimasukkan sebagai teks biasa (bukan HTML).
 import * as pdfjs from "../vendor/pdfjs/pdf.min.js";
 import { computeFaktur, customerKey } from "../src/calc.js";
+import { compareCoretax, readCoretaxFakturs } from "../src/coretax-pdf.js";
 import { rowsFromText } from "../src/csv.js";
 import * as M from "../src/master.js";
 import { parseInvoices } from "../src/parser.js";
@@ -9,7 +10,8 @@ import { extractPages } from "../src/pdf-text.js";
 import { normalizeUnit, TRX_CODES, UNIT_NAMES } from "../src/satuan.js";
 import { fold, guessQuery, searchCodes, words } from "../src/search.js";
 import { readXlsxRows } from "../src/xlsx.js";
-import { buildXml } from "../src/xml.js";
+import { VERSION } from "../src/version.js";
+import { buildXml, verifyXml } from "../src/xml.js";
 import { GitHubStore, MemoryStore } from "./storage.js";
 import { seal, unseal, WrongPinError } from "./vault.js";
 
@@ -32,7 +34,11 @@ const state = {
   saveError: "",
   invoices: [],
   fakturs: [],
+  coretax: [], // faktur pajak Coretax yang dipilih untuk dicocokkan: { file, faktur }
+  exportInfo: null, // XML yang akan di-download dan hasil pemeriksaannya, dihitung ulang tiap render
+  lastExport: null, // XML terakhir yang di-download dari daftar ini: { numbers, xml, at, file }
   view: "main",
+  filter: null, // saringan daftar invoice menurut status: null (semua), "ok", "warn", atau "error"
   tab: "customers",
   query: "",
   filename: "",
@@ -161,10 +167,37 @@ function start() {
   for (const ev of ["pointerdown", "keydown"]) addEventListener(ev, () => (state.lastActivity = Date.now()), { passive: true });
   setInterval(checkIdle, 30 * 1000);
   document.addEventListener("visibilitychange", checkIdle);
+  listenForDrops();
 
   if (DEMO) return connect(new MemoryStore()).catch((err) => toast(err.message, "error"));
   if (state.local.sealed) showUnlock();
   else showSetup();
+}
+
+/** PDF bisa diseret dari folder lalu dilepas di mana saja di jendela aplikasi (setelah data master terbuka). */
+function listenForDrops() {
+  let depth = 0;
+  const hasFiles = (e) => Boolean(state.master) && [...(e.dataTransfer?.types ?? [])].includes("Files");
+  const stop = () => {
+    depth = 0;
+    document.body.classList.remove("dragging");
+  };
+  addEventListener("dragenter", (e) => {
+    if (!hasFiles(e)) return;
+    depth++;
+    document.body.classList.add("dragging");
+  });
+  addEventListener("dragleave", (e) => hasFiles(e) && --depth <= 0 && stop());
+  addEventListener("dragover", (e) => hasFiles(e) && e.preventDefault());
+  addEventListener("drop", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    stop();
+    const files = [...e.dataTransfer.files].filter((f) => f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf"));
+    if (!files.length) return toast("Yang bisa dilepas di sini hanya file PDF.", "error");
+    if (state.view !== "main") go("main");
+    addPdfs(files);
+  });
 }
 
 function showSetup(message = "") {
@@ -307,7 +340,7 @@ async function lock(auto = false) {
     if (auto) return; // jangan mengunci otomatis kalau masih ada perubahan yang gagal disimpan
     if (!confirm("Ada perubahan data master yang belum tersimpan. Tetap kunci?")) return;
   }
-  Object.assign(state, { store: null, master: null, shas: {}, invoices: [], fakturs: [], view: "main", filename: "" });
+  Object.assign(state, { store: null, master: null, shas: {}, invoices: [], fakturs: [], coretax: [], exportInfo: null, lastExport: null, filter: null, view: "main", filename: "" });
   state.dirty.clear();
   // Dialog (Lihat PDF, cari kode barang) ada di luar #app, jadi ditutup juga supaya isinya tidak tampil di layar PIN
   for (const dialog of document.querySelectorAll(".dialog")) dialog.remove();
@@ -376,7 +409,7 @@ function mergeRemote(key, text) {
   } else if (key === "items") m.items = { ...remote.items, ...m.items };
   else if (key === "units") m.units = { ...remote.units, ...m.units };
   else if (key === "history") {
-    for (const r of remote.history) if (!m.history.some((x) => x.number === r.number && x.exportedAt === r.exportedAt)) m.history.push(r);
+    for (const r of remote.history) if (!m.history.some((x) => x.number === r.number && x.exportedAt === r.exportedAt && x.batch === r.batch)) m.history.push(r);
   }
 }
 
@@ -401,13 +434,65 @@ function computeSettings() {
 
 function computeAll() {
   const settings = computeSettings();
+  const exported = M.exportStatus(state.master.history, state.invoices.map((i) => i.number), state.lastExport);
   state.fakturs = state.invoices.map((invoice) => {
     const f = computeFaktur(invoice, state.master, settings);
-    const done = state.master.history.filter((r) => r.number === invoice.number).at(-1);
-    if (done) f.checks.push({ level: "warn", message: `Sudah pernah dibuatkan XML pada ${done.exportedAt} (${done.file})` });
+    const status = exported[invoice.number];
+    if (status) {
+      // Invoice yang sudah pernah dibuatkan XML tidak boleh ikut XML baru tanpa dipilih dulu: faktur bisa terbit dua kali.
+      const where = `${status.previous.exportedAt} (${status.previous.file})`;
+      f.exported = { ...status, repeat: Boolean(invoice.repeat) };
+      if (status.state === "done") f.checks.push({ level: "ok", message: `Sudah masuk XML ${status.previous.file} (${status.previous.exportedAt})` });
+      else if (invoice.repeat) f.checks.push({ level: "info", message: `Dibuat lagi atas pilihanmu. Sebelumnya sudah dibuatkan XML pada ${where}.` });
+      else f.checks.push({ level: "error", kind: "duplicate", message: `Sudah pernah dibuatkan XML pada ${where}` });
+      f.ready = !f.checks.some((c) => c.level === "error");
+    }
     return f;
   });
+  if (state.filter && !state.fakturs.some((f) => statusOf(f)[0] === state.filter)) state.filter = null;
+  state.exportInfo = computeExport();
 }
+
+const sellerOk = () => M.normalizeNpwp(state.master.settings.npwpPenjual) !== null;
+
+/**
+ * Susun XML kalau semua faktur siap, lalu baca ulang isinya dan cocokkan dengan yang tampil di layar
+ * (rekap) dan dengan format Coretax. Download hanya bisa kalau tidak ada masalah.
+ */
+function computeExport() {
+  const total = state.fakturs.length;
+  const ready = state.fakturs.filter((f) => f.ready).length;
+  const info = { total, ready, lineCount: state.fakturs.reduce((a, f) => a + f.lines.length, 0), xml: null, problems: [], canExport: false };
+  if (!total || ready !== total || !sellerOk()) return info;
+  const s = state.master.settings;
+  const tin = M.normalizeNpwp(s.npwpPenjual);
+  const seller = { tin, idtku: M.normalizeNitku(s.nitkuPenjual, tin) };
+  try {
+    info.xml = buildXml(seller, state.fakturs, computeSettings());
+    info.problems = verifyXml(info.xml, seller, state.fakturs, computeSettings());
+    if (!wellFormed(info.xml)) info.problems.push("File XML tidak sah: tidak bisa dibaca sebagai XML");
+  } catch (err) {
+    info.problems = [err.message];
+  }
+  info.canExport = info.problems.length === 0;
+  return info;
+}
+
+/** Dibaca dengan pembaca XML browser, seperti Coretax membaca file impor. */
+function wellFormed(xml) {
+  try {
+    const doc = new DOMParser().parseFromString(xml.slice(xml.indexOf("<")), "application/xml");
+    return doc.getElementsByTagName("parsererror").length === 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Faktur yang tertahan karena sudah pernah dibuatkan XML dan belum dipilih: hapus atau buat lagi. */
+const heldBack = () => state.fakturs.filter((f) => f.exported?.state === "previous" && !f.exported.repeat);
+
+/** Semua invoice di daftar sudah masuk XML yang baru saja di-download. */
+const allDone = () => state.fakturs.length > 0 && state.fakturs.every((f) => f.exported?.state === "done");
 
 function render() {
   if (!state.master) return;
@@ -416,6 +501,13 @@ function render() {
   app.replaceChildren(topBar(), state.view === "master" ? masterView() : mainView());
   renderStatus();
   scrollTo(0, y);
+  // Di HP deretan tab lebih lebar dari layar: geser supaya tab yang aktif terlihat
+  const active = app.querySelector(".tabs .active");
+  if (active) {
+    const tabs = active.parentElement;
+    const hidden = active.getBoundingClientRect().right - tabs.getBoundingClientRect().right;
+    if (hidden > 0) tabs.scrollLeft += hidden + 12;
+  }
 }
 
 function go(view) {
@@ -435,7 +527,10 @@ function topBar() {
       {},
       state.view === "master"
         ? h("button", { class: "secondary", onclick: () => go("main") }, "← Invoice")
-        : h("button", { class: "secondary", onclick: () => go("master") }, "Data master"),
+        : [
+            h("button", { class: "secondary", onclick: () => { state.tab = "history"; go("master"); } }, "Riwayat"),
+            h("button", { class: "secondary", onclick: () => { if (state.tab === "history") state.tab = "customers"; go("master"); } }, "Data master"),
+          ],
       !DEMO && h("button", { class: "secondary", onclick: () => lock() }, "Kunci"),
     ),
     h("div", { id: "save-status", class: "save-status" }),
@@ -461,10 +556,13 @@ function mainView() {
       }),
       h("strong", {}, "Pilih PDF invoice"),
       h("span", {}, "Bisa beberapa file sekaligus. PDF dibaca di perangkat ini saja, tidak di-upload ke mana pun."),
+      h("span", {}, "Faktur pajak yang sudah terbit di Coretax juga bisa dipilih di sini, untuk dicocokkan dengan invoicenya."),
     ),
+    state.coretax.length > 0 && coretaxPanel(),
+    state.fakturs.length > 1 && statusChips(),
     state.fakturs.length
-      ? state.fakturs.map((f, i) => invoiceCard(state.invoices[i], f))
-      : h("p", { class: "empty" }, "Belum ada invoice."),
+      ? state.fakturs.map((f, i) => (!state.filter || statusOf(f)[0] === state.filter) && invoiceCard(state.invoices[i], f))
+      : !state.coretax.length && h("p", { class: "empty" }, "Belum ada invoice."),
     state.fakturs.length > 0 && exportPanel(),
     state.fakturs.length > 0 && exportBar(),
     codeDatalist(),
@@ -479,6 +577,15 @@ async function addPdfs(files) {
       // kepadanya, jadi yang dibaca adalah salinannya.
       const bytes = new Uint8Array(await file.arrayBuffer());
       const pages = await extractPages(pdfjs, bytes.slice(), { disableFontFace: true });
+      // PDF faktur pajak dari Coretax: bukan invoice, tapi untuk dicocokkan dengan invoice atau Riwayat
+      const issued = readCoretaxFakturs(pages);
+      if (issued.length) {
+        for (const faktur of issued) {
+          state.coretax = state.coretax.filter((c) => c.faktur.ref !== faktur.ref);
+          state.coretax.push({ file: file.name, faktur });
+        }
+        continue;
+      }
       const { invoices, warnings } = parseInvoices(pages);
       if (!invoices.length) toast(`${file.name}: tidak ada invoice yang terbaca`, "error");
       for (const invoice of invoices) {
@@ -501,26 +608,106 @@ async function addPdfs(files) {
 
 /** [level, label] status faktur seperti di kartu invoice. */
 function statusOf(f) {
-  if (f.checks.some((c) => c.level === "error")) return ["error", "Belum lengkap"];
+  const errors = f.checks.filter((c) => c.level === "error");
+  if (errors.length) return ["error", errors.every((c) => c.kind === "duplicate") ? "Sudah pernah dibuat" : "Belum lengkap"];
   if (f.checks.some((c) => c.level === "warn")) return ["warn", "Perlu dicek"];
+  if (f.exported?.state === "done") return ["ok", "Sudah di-download"];
   return ["ok", "Siap"];
 }
 
+/** Ringkasan status di atas daftar; diklik untuk hanya menampilkan invoice dengan status itu. */
+function statusChips() {
+  const levels = state.fakturs.map((f) => statusOf(f)[0]);
+  const chip = (key, label) => {
+    const count = key ? levels.filter((l) => l === key).length : levels.length;
+    if (key && !count) return null;
+    const active = state.filter === key;
+    return h("button", { type: "button", class: `chip ${key ?? "all"}${active ? " active" : ""}`, "aria-pressed": String(active), onclick: () => { state.filter = key; render(); } }, `${label} `, h("strong", {}, count));
+  };
+  return h("div", { class: "chips", role: "group", "aria-label": "Saring invoice menurut status" }, chip(null, "Semua"), chip("ok", "Siap"), chip("warn", "Perlu dicek"), chip("error", "Belum siap"));
+}
+
+// ---------- cocokkan dengan faktur Coretax ----------
+
+/** Faktur buatan aplikasi untuk nomor referensi ini: dari daftar (lengkap dengan baris), atau total dari Riwayat. */
+function oursFor(ref) {
+  const f = state.fakturs.find((x) => x.number === ref);
+  if (f) return { from: "list", npwp: f.customer?.npwp, nitku: f.customer?.nitku, totals: f.totals, lines: f.lines };
+  const done = state.master.history.filter((r) => r.number === ref).at(-1);
+  if (done) return { from: "history", done, totals: done };
+  return null;
+}
+
+/** Hasil pencocokan PDF faktur Coretax dengan invoice di daftar, atau dengan Riwayat kalau invoicenya sudah tidak di daftar. */
+function coretaxPanel() {
+  const show = (r, value) => (r.kind === "money" ? num(value) : r.kind === "npwp" ? mask(value) : String(value));
+  const sorted = [...state.coretax].sort((a, b) => a.faktur.ref.localeCompare(b.faktur.ref));
+  const results = sorted.map(({ file, faktur }) => {
+    const ours = oursFor(faktur.ref);
+    const rows = ours ? compareCoretax(faktur, ours) : [];
+    const diffs = rows.filter((r) => !r.ok);
+    const [level, label] = !ours ? ["warn", "Invoice tidak ditemukan"] : !rows.length ? ["warn", "Tidak ada angka"] : diffs.length ? ["error", `${diffs.length} beda`] : ["ok", "Cocok"];
+    return { file, faktur, ours, rows, diffs, level, label };
+  });
+  const ok = results.filter((r) => r.level === "ok").length;
+  return h(
+    "section",
+    { class: "card coretax", id: "coretax" },
+    h(
+      "div",
+      { class: "export-head" },
+      h("h2", {}, "Cocokkan dengan faktur Coretax"),
+      h("button", { type: "button", class: "link", onclick: () => { state.coretax = []; render(); } }, "Hapus hasil"),
+    ),
+    h("p", { class: "muted" }, `${ok} dari ${results.length} faktur Coretax sama dengan yang dibuat aplikasi. Dicocokkan lewat nomor Referensi.`),
+    results.map(({ file, faktur, ours, rows, diffs, level, label }) =>
+      h(
+        "div",
+        { class: `match ${level}` },
+        h(
+          "header",
+          {},
+          h("div", {}, h("strong", {}, faktur.ref), h("small", {}, `Faktur ${faktur.number || "?"} · ${faktur.buyerName || "nama pembeli tidak terbaca"} · ${file}`)),
+          h("span", { class: `badge ${level}` }, label),
+        ),
+        !ours && h("p", { class: "muted" }, "Invoice dengan nomor ini tidak ada di daftar maupun di Riwayat. Pilih juga PDF invoicenya."),
+        ours && !rows.length && h("p", { class: "muted" }, "Riwayat XML ini dibuat sebelum angka rekap disimpan. Pilih juga PDF invoicenya untuk mencocokkan."),
+        rows.length > 0 && h("p", { class: "muted" }, ours.from === "list"
+          ? `${rows.length} hal dicek dengan invoice di daftar: NPWP dan NITKU pembeli, total, dan tiap baris barang.`
+          : `${rows.length} total dicek dengan Riwayat (${ours.done.file}, ${ours.done.exportedAt}). Pilih juga PDF invoicenya untuk mencocokkan NPWP dan tiap baris barang.`),
+        diffs.length > 0 &&
+          h(
+            "table",
+            { class: "match-diffs" },
+            h("thead", {}, h("tr", {}, h("th", {}), h("th", {}, "Aplikasi"), h("th", {}, "Coretax"))),
+            h("tbody", {}, diffs.map((r) => h("tr", {}, h("th", { scope: "row" }, r.label), h("td", {}, show(r, r.ours)), h("td", {}, show(r, r.theirs))))),
+          ),
+      )),
+  );
+}
+
+/** Kartu yang sudah siap dilipat jadi satu baris; yang perlu perhatian terbuka. */
 function invoiceCard(invoice, f) {
   const errors = f.checks.filter((c) => c.level === "error").length;
   const warnings = f.checks.filter((c) => c.level === "warn").length;
   const [level, label] = statusOf(f);
   const incomplete = f.lines.filter((l) => !isCode(l.code) || !isUnit(l.unit)).length;
+  const key = `card:${f.number}`;
+  const open = state.open[key] ?? level !== "ok";
+  const header = h(
+    "header",
+    {},
+    h("button", { type: "button", class: "icon toggle", "aria-expanded": String(open), "aria-label": `${open ? "Lipat" : "Buka"} ${f.number}`, onclick: () => { state.open[key] = !open; render(); } }, open ? "▾" : "▸"),
+    h("div", {}, h("strong", {}, f.number), h("small", {}, `${dateText(f.date)} · ${invoice.buyerName}${open ? "" : ` · ${f.lines.length} baris · PPN ${num(toRupiah(f.totals.vatSen) * 100)}`}`)),
+    h("span", { class: `badge ${level}` }, label),
+    h("button", { class: "icon", title: "Hapus dari daftar", "aria-label": `Hapus ${f.number} dari daftar`, onclick: () => removeInvoice(f.number) }, "✕"),
+  );
+  if (!open) return h("article", { class: `invoice ${level} folded`, id: `inv-${f.number}` }, header);
   return h(
     "article",
     { class: `invoice ${level}`, id: `inv-${f.number}` },
-    h(
-      "header",
-      {},
-      h("div", {}, h("strong", {}, f.number), h("small", {}, `${dateText(f.date)} · ${invoice.buyerName}`)),
-      h("span", { class: `badge ${level}` }, label),
-      h("button", { class: "icon", title: "Hapus dari daftar", "aria-label": `Hapus ${f.number} dari daftar`, onclick: () => removeInvoice(f.number) }, "✕"),
-    ),
+    header,
+    f.exported?.state === "previous" && repeatBox(invoice, f),
     h(
       "div",
       { class: "card-tools" },
@@ -543,8 +730,51 @@ function invoiceCard(invoice, f) {
 }
 
 function removeInvoice(number) {
-  state.invoices = state.invoices.filter((x) => x.number !== number);
+  removeInvoices([number]);
+}
+
+function removeInvoices(numbers) {
+  state.invoices = state.invoices.filter((x) => !numbers.includes(x.number));
   render();
+}
+
+/**
+ * Invoice yang sudah pernah dibuatkan XML: harus dipilih dulu, supaya faktur tidak terbit dua kali di Coretax.
+ * Setelah dipilih "tetap buat lagi", pilihan itu bisa dibatalkan.
+ */
+function repeatBox(invoice, f) {
+  const { previous, repeat } = f.exported;
+  const history = h("button", { type: "button", class: "link", onclick: () => showInHistory(invoice.number) }, "Lihat di Riwayat");
+  if (repeat) {
+    return h(
+      "div",
+      { class: "repeat chosen" },
+      h("p", {}, `Akan dibuatkan XML lagi atas pilihanmu. Sebelumnya: ${previous.file} (${previous.exportedAt}). `, history),
+      h("button", { type: "button", class: "link", onclick: () => { delete invoice.repeat; render(); } }, "Batalkan, jangan buat lagi"),
+    );
+  }
+  return h(
+    "div",
+    { class: "repeat" },
+    h("strong", {}, "Invoice ini sudah pernah dibuatkan XML"),
+    h("p", {}, `${previous.file} · ${previous.exportedAt} · `, history),
+    h("p", {}, "Kalau XML itu sudah diimpor ke Coretax, membuatnya lagi akan menerbitkan faktur ganda. Buat lagi hanya kalau XML sebelumnya gagal atau belum diimpor."),
+    h(
+      "div",
+      { class: "row" },
+      h("button", { type: "button", class: "secondary", onclick: () => removeInvoice(invoice.number) }, "Hapus dari daftar"),
+      h("button", { type: "button", class: "danger", onclick: () => { invoice.repeat = true; render(); } }, "Tetap buat lagi"),
+    ),
+  );
+}
+
+/** Buka Riwayat dengan pencarian nomor invoice ini. */
+function showInHistory(number) {
+  state.tab = "history";
+  state.view = "master";
+  state.query = number;
+  render();
+  scrollTo(0, 0);
 }
 
 function buyerBlock(invoice, f) {
@@ -687,10 +917,16 @@ function openPdfView(invoice, f) {
   );
   addEventListener("keydown", onKey);
   document.body.append(dialog);
-  renderPdfPages(invoice, pages).catch((err) => pages.replaceChildren(h("p", { class: "error" }, `PDF gagal ditampilkan: ${err.message}`)));
+  renderPdfPages(invoice, pages, f.flags).catch((err) => pages.replaceChildren(h("p", { class: "error" }, `PDF gagal ditampilkan: ${err.message}`)));
 }
 
-async function renderPdfPages(invoice, box) {
+/** Apakah bagian yang ditandai ini bermasalah menurut pemeriksaan (baris barang, ringkasan, atau kop). */
+function isBad(m, flags) {
+  if (m.kind === "line") return flags.lines.includes(Number(m.label) - 1);
+  return flags[m.kind]?.includes(m.key) ?? false;
+}
+
+async function renderPdfPages(invoice, box, flags) {
   // Huruf digambar sebagai garis (disableFontFace), karena aturan keamanan aplikasi tidak mengizinkan font dari luar file.
   const task = pdfjs.getDocument({ data: invoice.source.bytes.slice(), isEvalSupported: false, disableFontFace: true, verbosity: 0 });
   try {
@@ -704,7 +940,7 @@ async function renderPdfPages(invoice, box) {
       const viewport = page.getViewport({ scale: (width / base.width) * Math.min(4, 2 * (devicePixelRatio || 1)) });
       const canvas = h("canvas", { width: Math.ceil(viewport.width), height: Math.ceil(viewport.height), role: "img", "aria-label": `Halaman ${number}` });
       await page.render({ canvas, viewport }).promise;
-      out.push(h("div", { class: "pdf-page" }, canvas, (invoice.marks ?? []).filter((m) => m.page === number).map((m) => markEl(m, base))));
+      out.push(h("div", { class: "pdf-page" }, canvas, (invoice.marks ?? []).filter((m) => m.page === number).map((m) => markEl({ ...m, bad: isBad(m, flags) }, base))));
     }
     box.replaceChildren(...out);
   } finally {
@@ -715,7 +951,7 @@ async function renderPdfPages(invoice, box) {
 /** Tanda di atas halaman, dalam persen ukuran halaman supaya ikut membesar saat diperbesar. */
 function markEl(m, base) {
   const pad = 1.5; // pt
-  const el = h("div", { class: "pdf-mark" }, m.label && h("span", {}, m.label));
+  const el = h("div", { class: `pdf-mark${m.bad ? " bad" : ""}` }, m.label && h("span", {}, m.label));
   Object.assign(el.style, {
     left: `${((m.x0 - pad) / base.width) * 100}%`,
     top: `${((m.top - pad / 2) / base.height) * 100}%`,
@@ -731,17 +967,21 @@ function readPanel(invoice, f) {
   const n = (v) => (v == null ? "–" : v.toLocaleString("en-US", { maximumFractionDigits: 4 })); // seperti di invoice: 2,100,000
   const printed = invoice.pages.length ? `${invoice.pages.map((p) => p.index).join(", ")} dari ${invoice.pages[0].of}` : "tidak terbaca";
   const summaryRows = [["Sub Total", "subTotal"], ["Discount", "discount"], ["PPN", "ppn"], ["Biaya Kirim", "shipping"], ["Total", "total"]];
+  const flags = f.flags;
+  const bad = (group, key) => (flags[group].includes(key) ? "bad" : null);
+  const flagged = flags.lines.length + flags.summary.length + flags.header.length > 0;
   return h(
     "section",
     { class: "pdf-read" },
     h("h3", {}, "Yang dibaca aplikasi"),
     h("p", { class: "muted" }, "Bagian PDF yang dibaca diberi tanda kuning; nomor baris barang sama dengan tabel di bawah. Kalau ada baris di PDF yang tidak bertanda, baris itu tidak terbaca."),
+    flagged && h("p", { class: "bad-note" }, "Tanda merah = bagian yang bermasalah menurut Pemeriksaan di kartu invoice."),
     h(
       "dl",
       { class: "read-head" },
       h("dt", {}, "Nomor"), h("dd", {}, invoice.number),
       h("dt", {}, "Tgl Faktur"), h("dd", {}, shortDate(invoice.date)),
-      h("dt", {}, "Kepada"), h("dd", {}, invoice.buyerName || "tidak terbaca"),
+      h("dt", {}, "Kepada"), h("dd", { class: bad("header", "buyer") }, invoice.buyerName || "tidak terbaca"),
       h("dt", {}, "Kontak"), h("dd", {}, invoice.contact || "–"),
       h("dt", {}, "No Po"), h("dd", {}, invoice.poNumber || "–"),
       h("dt", {}, "Halaman"), h("dd", {}, printed),
@@ -761,7 +1001,7 @@ function readPanel(invoice, f) {
           invoice.lines.map((l, i) =>
             h(
               "tr",
-              {},
+              { class: bad("lines", i) },
               h("td", {}, h("span", { class: "line-no" }, i + 1)),
               h("td", { class: "mono" }, l.code || "–"),
               h("td", {}, l.name),
@@ -774,7 +1014,7 @@ function readPanel(invoice, f) {
         ),
       ),
     ),
-    h("table", { class: "read-table read-summary" }, h("tbody", {}, summaryRows.map(([label, key]) => h("tr", {}, h("th", { scope: "row" }, label), h("td", { class: "num" }, n(s[key])))))),
+    h("table", { class: "read-table read-summary" }, h("tbody", {}, summaryRows.map(([label, key]) => h("tr", { class: bad("summary", key) }, h("th", { scope: "row" }, label), h("td", { class: "num" }, n(s[key])))))),
   );
 }
 
@@ -876,13 +1116,6 @@ function setLineUnit(line, unit) {
     markDirty("items");
   }
   render();
-}
-
-function exportState() {
-  const ready = state.fakturs.filter((f) => f.ready).length;
-  const total = state.fakturs.length;
-  const sellerOk = M.normalizeNpwp(state.master.settings.npwpPenjual) !== null;
-  return { ready, total, sellerOk, canExport: ready === total && sellerOk };
 }
 
 // ---------- rekap ----------
@@ -990,13 +1223,76 @@ async function copyRecap(rows) {
   }
 }
 
+/** Lompat ke kartu invoice; kartu yang terlipat atau tersaring dibuka dulu. */
 function scrollToInvoice(number) {
+  if (state.filter || !(state.open[`card:${number}`] ?? false)) {
+    state.filter = null;
+    state.open[`card:${number}`] = true;
+    render();
+  }
   document.getElementById(`inv-${number}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-/** Panel di bawah daftar: rekap isi XML, nama file, dan pilihan lain. */
+function clearList() {
+  state.invoices = [];
+  state.filename = "";
+  state.lastExport = null; // daftar baru: invoice yang sudah di-download tadi harus dipilih lagi kalau dimasukkan ulang
+  render();
+}
+
+/** Apa yang menahan download, atau hasil pemeriksaan XML kalau sudah bisa di-download. */
+function exportStatusBlock() {
+  const { ready, total, lineCount, problems, canExport } = state.exportInfo;
+  if (!sellerOk()) return h("p", { class: "error" }, "Isi dulu NPWP penjual di Data master → Pengaturan.");
+  const held = heldBack();
+  const others = total - ready - held.length;
+  if (held.length || others > 0) {
+    return [
+      held.length > 0 &&
+        h(
+          "div",
+          { class: "repeat" },
+          h("strong", {}, `${held.length} invoice sudah pernah dibuatkan XML: ${held.map((f) => f.number).join(", ")}`),
+          h("p", {}, "Supaya faktur tidak terbit dua kali di Coretax, hapus dari daftar. Buat lagi hanya kalau XML sebelumnya gagal atau belum diimpor."),
+          held.length > 1 &&
+            h(
+              "div",
+              { class: "row" },
+              h("button", { type: "button", class: "secondary", onclick: () => removeInvoices(held.map((f) => f.number)) }, `Hapus ${held.length} invoice ini`),
+              h("button", { type: "button", class: "danger", onclick: () => repeatAll(held) }, "Tetap buat lagi semuanya"),
+            ),
+        ),
+      others > 0 && h("p", { class: "muted" }, "Lengkapi faktur yang belum siap, atau hapus dari daftar."),
+    ];
+  }
+  if (!canExport) {
+    return h(
+      "div",
+      { class: "xml-check error" },
+      h("strong", {}, "XML tidak bisa dibuat karena isinya tidak sesuai:"),
+      h("ul", {}, problems.map((p) => h("li", {}, p))),
+      h("small", {}, "Ini seharusnya tidak terjadi. Kirim tangkapan layar ini ke pembuat aplikasi."),
+    );
+  }
+  return [
+    h("p", { class: "xml-check ok" }, `XML sudah dibaca ulang dan dicek: ${total} faktur dan ${lineCount} baris barang di file sama persis dengan rekap ini. NPWP, NITKU, kode barang, satuan, dan rumus DPP Nilai Lain serta PPN di setiap baris sesuai format Coretax.`),
+    allDone() &&
+      h("p", { class: "notice" }, `Daftar ini sudah di-download pada ${state.lastExport.at} (${state.lastExport.file}). Download lagi hanya kalau file itu hilang, dan jangan impor dua kali ke Coretax.`),
+  ];
+}
+
+function repeatAll(fakturs) {
+  if (!confirm(`Buat XML lagi untuk ${fakturs.length} invoice yang sudah pernah dibuatkan XML? Pastikan XML sebelumnya belum diimpor ke Coretax, supaya faktur tidak terbit dua kali.`)) return;
+  for (const f of fakturs) {
+    const invoice = state.invoices.find((x) => x.number === f.number);
+    if (invoice) invoice.repeat = true;
+  }
+  render();
+}
+
+/** Panel di bawah daftar: rekap isi XML, hasil pemeriksaan, nama file, dan pilihan lain. */
 function exportPanel() {
-  const { ready, total, sellerOk, canExport } = exportState();
+  const { total, canExport } = state.exportInfo;
   const rows = state.fakturs.map(recapRow);
   if (!state.filename) state.filename = defaultFilename();
   return h(
@@ -1017,39 +1313,38 @@ function exportPanel() {
       h("li", {}, "✓ = sama dengan invoice. Klik nomor referensi untuk melihat invoicenya."),
       h("li", {}, "Nama pembeli di Coretax diisi otomatis dari NPWP di data master. Kalau namanya beda dengan rekap ini, cek NPWP pelanggan itu di data master."),
     ),
+    exportStatusBlock(),
     field("Nama file", h("input", { value: state.filename, oninput: (e) => (state.filename = e.target.value) })),
     h(
       "div",
       { class: "row" },
       typeof navigator.canShare === "function" && h("button", { class: "secondary", disabled: !canExport, onclick: () => exportXml(true) }, "Bagikan XML…"),
-      h("button", { class: "link", onclick: () => { state.invoices = []; state.filename = ""; render(); } }, "Kosongkan daftar"),
+      h("button", { class: "link", onclick: clearList }, "Kosongkan daftar"),
     ),
-    !sellerOk && h("p", { class: "error" }, "Isi dulu NPWP penjual di Data master → Pengaturan."),
-    ready !== total && h("p", { class: "muted" }, "Lengkapi faktur yang belum siap, atau hapus dari daftar."),
   );
 }
 
 /** Baris ringkas yang selalu terlihat di bawah layar. */
 function exportBar() {
-  const { ready, total, canExport } = exportState();
+  const { ready, total, canExport } = state.exportInfo;
   return h(
     "div",
     { class: "export-bar" },
-    h("span", {}, h("strong", {}, `${ready} dari ${total}`), " faktur siap"),
-    h("button", { type: "button", class: "link", onclick: () => document.getElementById("rekap")?.scrollIntoView({ behavior: "smooth" }) }, "Rekap"),
-    h("button", { disabled: !canExport, onclick: () => exportXml(false) }, "Download XML"),
+    h("span", {}, h("strong", {}, `${ready} dari ${total}`), " faktur siap", h("small", {}, `PPN ${num(state.fakturs.reduce((a, f) => a + toRupiah(f.totals.vatSen), 0) * 100)}`)),
+    h("button", { type: "button", class: "link", onclick: () => document.getElementById("rekap")?.scrollIntoView({ behavior: "smooth" }) }, "Lihat rekap"),
+    h("button", { disabled: !canExport, onclick: () => exportXml(false) }, allDone() ? "Download lagi" : "Download XML"),
   );
 }
 
 async function exportXml(share) {
-  const s = state.master.settings;
-  const npwp = M.normalizeNpwp(s.npwpPenjual);
-  let xml;
-  try {
-    xml = buildXml({ tin: npwp, idtku: M.normalizeNitku(s.nitkuPenjual, npwp) }, state.fakturs, computeSettings());
-  } catch (err) {
-    return toast(err.message, "error");
+  // Dihitung ulang tepat sebelum download, supaya yang di-download pasti yang baru saja diperiksa.
+  const { xml, problems, canExport } = computeExport();
+  if (!canExport) {
+    render();
+    return toast(problems[0] ?? "XML belum bisa dibuat", "error");
   }
+  const again = allDone();
+  if (again && !confirm(`Daftar ini sudah di-download pada ${state.lastExport.at} (${state.lastExport.file}). Download lagi?\n\nJangan impor dua kali ke Coretax: faktur akan terbit ganda.`)) return;
   const name = (state.filename.trim() || defaultFilename()).replace(/\.xml$/i, "") + ".xml";
   const file = new File([xml], name, { type: "application/xml" });
   if (share) {
@@ -1068,10 +1363,20 @@ async function exportXml(share) {
     link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 60 * 1000);
   }
+  // File yang sama persis di-download ulang tidak dicatat lagi di riwayat.
+  if (again && xml === state.lastExport.xml) {
+    toast(`${name} di-download lagi (isi sama dengan sebelumnya). Jangan impor dua kali ke Coretax.`, "ok");
+    return render();
+  }
   const at = stamp();
-  for (const f of state.fakturs) state.master.history.push({ number: f.number, invoiceDate: f.date, buyer: f.buyerName, exportedAt: at, file: name });
+  const batch = String(Date.now()); // satu kelompok riwayat per file XML
+  for (const f of state.fakturs) {
+    const { discountSen, taxBaseSen, otherTaxBaseSen, vatSen } = f.totals;
+    state.master.history.push({ number: f.number, invoiceDate: f.date, buyer: f.buyerName, exportedAt: at, file: name, batch, discountSen, taxBaseSen, otherTaxBaseSen, vatSen });
+  }
   markDirty("history");
-  toast(`${name} dibuat (${state.fakturs.length} faktur)`, "ok");
+  state.lastExport = { numbers: state.invoices.map((i) => i.number), xml, at, file: name };
+  toast(`${name} dibuat (${state.fakturs.length} faktur), isinya sudah dicek ulang. Rekapnya tersimpan di Riwayat.`, "ok");
   render();
 }
 
@@ -1110,8 +1415,9 @@ function masterView() {
     items: `Barang (${Object.keys(m.items).length})`,
     units: "Satuan",
     settings: "Pengaturan",
+    history: `Riwayat (${historyFiles().length})`,
   };
-  const body = { customers: customersTab, items: itemsTab, units: unitsTab, settings: settingsTab }[state.tab]();
+  const body = { customers: customersTab, items: itemsTab, units: unitsTab, settings: settingsTab, history: historyTab }[state.tab]();
   return h(
     "main",
     { class: "master" },
@@ -1120,6 +1426,47 @@ function masterView() {
     body,
     codeDatalist(),
   );
+}
+
+/** Riwayat dikelompokkan per file XML, yang terbaru di atas. */
+function historyFiles() {
+  const files = new Map();
+  for (const r of state.master.history) {
+    const key = r.batch ? `batch:${r.batch}` : `${r.exportedAt ?? ""}|${r.file ?? ""}`; // riwayat lama belum punya kelompok
+    if (!files.has(key)) files.set(key, { key, exportedAt: r.exportedAt ?? "", file: r.file ?? "", rows: [] });
+    files.get(key).rows.push(r);
+  }
+  return [...files.values()].reverse();
+}
+
+function historyTab() {
+  const files = historyFiles();
+  const row = (r) => ({ number: r.number, date: r.invoiceDate, buyerName: r.buyer, discountSen: r.discountSen, taxBaseSen: r.taxBaseSen, otherTaxBaseSen: r.otherTaxBaseSen, vatSen: r.vatSen });
+  return [
+    h("p", { class: "muted" }, "XML yang pernah dibuat, dari semua perangkat yang memakai data master ini; yang terbaru di atas. Rekapnya bisa dicocokkan dengan daftar faktur keluaran di Coretax."),
+    searchBox("Cari nomor invoice atau nama pembeli"),
+    listSection(() => {
+      const q = state.query.trim().toUpperCase();
+      const matches = (r) => String(r.number ?? "").toUpperCase().includes(q) || String(r.buyer ?? "").toUpperCase().includes(q);
+      const shown = files.filter((g) => !q || g.rows.some(matches));
+      if (!shown.length) return [h("p", { class: "empty" }, q ? "Tidak ada yang cocok." : "Belum ada XML yang dibuat.")];
+      return [
+        ...shown.slice(0, 100).map((g, i) => {
+          const rows = g.rows.map(row);
+          const vat = recapTotal(rows, "vatSen");
+          return h(
+            "details",
+            { class: "row-item history", open: state.open[`riwayat:${g.key}`] ?? (i === 0 || Boolean(q)), ontoggle: (e) => (state.open[`riwayat:${g.key}`] = e.target.open) },
+            h("summary", {}, h("span", {}, h("strong", {}, g.file || "(tanpa nama)"), h("small", {}, g.exportedAt)), h("span", { class: "muted" }, `${rows.length} faktur${vat == null ? "" : ` · PPN ${num(vat * 100)}`}`)),
+            recapTable(rows),
+            rows.some((r) => r.vatSen == null) && h("p", { class: "muted" }, "Angka rekap hanya tersimpan untuk XML yang dibuat sejak fitur rekap ada."),
+            h("div", { class: "row" }, h("button", { type: "button", class: "secondary", onclick: () => copyRecap(rows) }, "Salin rekap")),
+          );
+        }),
+        shown.length > 100 && h("p", { class: "muted" }, "Ketik untuk mencari XML lainnya."),
+      ];
+    }),
+  ];
 }
 
 function customersTab() {
@@ -1416,7 +1763,7 @@ function settingsTab() {
     h("p", { class: "error", hidden: true }),
     h("button", { type: "submit" }, "Simpan pengaturan"),
   );
-  return [form, securityBox()];
+  return [form, securityBox(), h("p", { class: "muted version" }, `Versi aplikasi ${VERSION}`)];
 }
 
 function securityBox() {

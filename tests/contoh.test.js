@@ -8,7 +8,7 @@ import { computeFaktur } from "../src/calc.js";
 import { parseInvoices } from "../src/parser.js";
 import { extractPages } from "../src/pdf-text.js";
 import { DEFAULT_UNITS } from "../src/satuan.js";
-import { buildXml } from "../src/xml.js";
+import { buildXml, verifyXml } from "../src/xml.js";
 
 const file = (name) => new URL(`../contoh/${name}`, import.meta.url);
 const expectations = existsSync(file("harapan.json")) ? JSON.parse(readFileSync(file("harapan.json"), "utf8")) : null;
@@ -45,7 +45,10 @@ test("PDF contoh menghasilkan XML yang sama persis dengan buatan pengguna", { sk
     const fakturs = invoices.map((invoice) => computeFaktur(invoice, master));
     for (const f of fakturs) assert.deepEqual(problems(f), [], f.number);
 
-    const out = buildXml({ tin: tag(xml, "TIN"), idtku: tag(xml, "SellerIDTKU") }, fakturs);
+    const seller = { tin: tag(xml, "TIN"), idtku: tag(xml, "SellerIDTKU") };
+    const out = buildXml(seller, fakturs);
+    // XML buatan pengguna yang sudah diterima Coretax juga lolos pemeriksaan sebelum download
+    assert.deepEqual(verifyXml(out, seller, fakturs), [], xmlName);
     assert.equal(out, xml, xmlName);
     assert.ok(Buffer.from(out, "utf8").equals(expected), `isi byte ${xmlName} berbeda`);
   }

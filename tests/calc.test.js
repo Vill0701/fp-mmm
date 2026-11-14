@@ -3,6 +3,8 @@ import { test } from "node:test";
 import { allocate, computeFaktur, detectVatMode } from "../src/calc.js";
 import { formatSen, mulDiv } from "../src/money.js";
 import { DEFAULT_UNITS } from "../src/satuan.js";
+import { buildXml, readXml, verifyXml } from "../src/xml.js";
+import { compareCoretax } from "../src/coretax-pdf.js";
 
 // Data uji buatan, bukan NPWP asli.
 const NPWP = "1".repeat(16);
@@ -141,4 +143,79 @@ test("pembeli dan kode barang yang belum ada di data master ditandai", () => {
     "Kode barang Coretax belum diisi untuk 1 baris",
     "Satuan Coretax belum diisi untuk 1 baris",
   ]);
+});
+
+test("bagian invoice yang bermasalah ditandai untuk Lihat PDF", () => {
+  const good = computeFaktur(invoice([["A1", 1, "PCS", 100000]], { subTotal: 100000, ppn: 11000, total: 111000 }), master);
+  assert.deepEqual(good.flags, { lines: [], summary: [], header: [] });
+  // Baris 2: Total Harga lebih besar dari Qty × @Harga; pembeli tidak ada di data master
+  const bad = computeFaktur({ ...invoice([["A1", 1, "PCS", 100000], ["B2", 1, "KLG", 50000, 60000]], { subTotal: 160000, ppn: 17600, total: 177600 }), buyerName: "PT LAIN" }, master);
+  assert.deepEqual(bad.flags.lines, [1]);
+  assert.deepEqual(bad.flags.header, ["buyer"]);
+});
+
+test("XML dibaca ulang dan diperiksa sebelum download", () => {
+  const seller = { tin: NPWP, idtku: NPWP + "000000" };
+  const fakturs = [
+    computeFaktur(invoice([["A1", 10, "PCS", 10000, 90000, "10"], ["B2", 2, "KLG", 50000]], { subTotal: 190000, discount: 19000, ppn: 18810, total: 189810 }), master),
+    computeFaktur({ ...invoice([["A1", 2, "PCS", 111000], ["B2", 1, "KLG", 55500]], { subTotal: 277500, ppn: 27500, total: 277500 }), number: "SI.UJI.00002" }, master),
+    computeFaktur({ ...invoice([["A1", 1, "PCS", 100000]], { subTotal: 100000, shipping: 10000, ppn: 11000, total: 121000 }), number: "SI.UJI.00003" }, master),
+  ];
+  assert.ok(fakturs.every((f) => f.ready));
+  const xml = buildXml(seller, fakturs);
+  const read = readXml(xml);
+  assert.deepEqual(read.fakturs.map((x) => x.totals), fakturs.map((f) => f.totals));
+  assert.deepEqual(verifyXml(xml, seller, fakturs), []);
+  // Isi yang berbeda dari layar tertangkap
+  assert.deepEqual(verifyXml(xml.replace("<VAT>8910</VAT>", "<VAT>8911</VAT>"), seller, fakturs), [
+    "SI.UJI.00001: baris 1: PPN di XML tidak sama dengan di layar",
+    "SI.UJI.00001: baris 1: PPN tidak sama dengan 12% × DPP Nilai Lain",
+    "SI.UJI.00001: total faktur di XML tidak sama dengan rekap",
+  ]);
+  assert.deepEqual(verifyXml(xml.replace("<RefDesc>SI.UJI.00002</RefDesc>", "<RefDesc>SI.UJI.00001</RefDesc>"), seller, fakturs), [
+    "SI.UJI.00001: nomor referensi muncul lebih dari sekali",
+    "SI.UJI.00002: nomor referensi di XML tidak sama dengan di layar",
+  ]);
+  assert.deepEqual(verifyXml(xml, { ...seller, tin: "5".repeat(16) }, fakturs), ["NPWP penjual di XML tidak sama dengan Pengaturan, atau bukan 16 angka"]);
+});
+
+/** Faktur Coretax tiruan seperti hasil readCoretaxFakturs: Harga × Qty per baris, total dibulatkan ke rupiah. */
+function coretaxOf(f) {
+  const rp = (sen) => Math.round(sen / 100) * 100;
+  const goods = f.lines.map((l, i) => ({ no: i + 1, name: l.name, priceSen: l.priceSen, qty: l.qty, unit: l.unit, code: l.code, grossSen: l.taxBaseSen + l.discountSen, discountSen: l.discountSen }));
+  return {
+    ref: f.number,
+    number: "0".repeat(17),
+    buyerName: "PT CONTOH JAYA",
+    buyerNpwp: f.customer.npwp,
+    buyerNitku: f.customer.nitku,
+    goods,
+    grossSen: rp(goods.reduce((a, g) => a + g.grossSen, 0)),
+    discountSen: rp(f.totals.discountSen),
+    otherTaxBaseSen: rp(f.totals.otherTaxBaseSen),
+    vatSen: rp(f.totals.vatSen),
+  };
+}
+
+test("faktur Coretax dicocokkan dengan faktur buatan aplikasi (daftar dan Riwayat)", () => {
+  const fakturs = [
+    computeFaktur(invoice([["A1", 10, "PCS", 10000, 90000, "10"], ["B2", 2, "KLG", 50000]], { subTotal: 190000, discount: 19000, ppn: 18810, total: 189810 }), master),
+    computeFaktur(invoice([["A1", 2, "PCS", 111000], ["B2", 1, "KLG", 55500]], { subTotal: 277500, ppn: 27500, total: 277500 }), master), // harga termasuk PPN
+    computeFaktur(invoice([["A1", 1, "PCS", 100000]], { subTotal: 100000, shipping: 10000, ppn: 11000, total: 121000 }), master), // biaya kirim
+  ];
+  for (const f of fakturs) {
+    const ours = { npwp: f.customer.npwp, nitku: f.customer.nitku, totals: f.totals, lines: f.lines };
+    const rows = compareCoretax(coretaxOf(f), ours);
+    assert.deepEqual(rows.filter((r) => !r.ok), []);
+    assert.equal(rows.length, 6 + 1 + 7 * f.lines.length);
+    // Dari Riwayat hanya total yang tersimpan (angka sen dari riwayat.csv)
+    assert.ok(compareCoretax(coretaxOf(f), { totals: { ...f.totals } }).every((r) => r.ok));
+  }
+  // Qty yang berbeda di Coretax tertangkap per baris
+  const f = fakturs[0];
+  const c = coretaxOf(f);
+  c.goods[1] = { ...c.goods[1], qty: 3 };
+  assert.deepEqual(compareCoretax(c, { npwp: f.customer.npwp, nitku: f.customer.nitku, totals: f.totals, lines: f.lines }).filter((r) => !r.ok).map((r) => r.label), ["Baris 2: Qty"]);
+  // NPWP pembeli yang berbeda tertangkap
+  assert.deepEqual(compareCoretax({ ...c, goods: coretaxOf(f).goods, buyerNpwp: "3".repeat(16) }, { npwp: f.customer.npwp, totals: f.totals }).filter((r) => !r.ok).map((r) => r.label), ["NPWP pembeli"]);
 });

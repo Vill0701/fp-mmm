@@ -6,11 +6,13 @@ Buka aplikasinya di **https://vill0701.github.io/fp-mmm/** (mode coba tanpa data
 
 ## Cara pakai
 
-1. Pilih satu atau beberapa PDF invoice. PDF dibaca di perangkat, tidak di-upload ke mana pun.
-2. Aplikasi memeriksa setiap invoice: halaman lengkap, jumlah baris sama dengan Sub Total, harga sudah atau belum termasuk PPN, dan PPN faktur sama dengan PPN invoice. Tombol **Lihat PDF** menampilkan halaman invoice asli (semua halamannya) di samping yang dibaca aplikasi; bagian yang dibaca diberi tanda kuning dan baris barang bernomor, jadi baris yang tidak terbaca kelihatan karena tidak bertanda.
+1. Pilih satu atau beberapa PDF invoice, atau seret file PDF ke jendela aplikasi. PDF dibaca di perangkat, tidak di-upload ke mana pun.
+2. Aplikasi memeriksa setiap invoice: halaman lengkap, jumlah baris sama dengan Sub Total, harga sudah atau belum termasuk PPN, dan PPN faktur sama dengan PPN invoice. Tombol **Lihat PDF** menampilkan halaman invoice asli (semua halamannya) di samping yang dibaca aplikasi; bagian yang dibaca diberi tanda kuning dan baris barang bernomor, jadi baris yang tidak terbaca kelihatan karena tidak bertanda. Bagian yang bermasalah menurut pemeriksaan diberi tanda merah. Invoice yang sudah siap dilipat jadi satu baris, dan daftar bisa disaring menurut status (Siap, Perlu dicek, Belum siap).
 3. Lengkapi yang kurang (NPWP pembeli, kode barang, satuan). Isian diingat untuk invoice berikutnya.
-4. Cek **Rekap XML** di bawah daftar: Referensi, Nama Pembeli, Harga Jual, DPP Nilai Lain, dan PPN tiap faktur, dibulatkan ke rupiah seperti di daftar faktur Coretax, dengan ✓ kalau sama dengan invoice. Rekap bisa disalin untuk ditempel di Excel.
-5. Download XML, lalu impor di Coretax. Cocokkan daftar faktur di Coretax dengan rekap lewat nomor Referensi. Nama pembeli di Coretax diisi dari NPWP di data master, jadi nama yang berbeda berarti NPWP pelanggan itu perlu dicek.
+4. Cek **Rekap XML** di bawah daftar: Referensi, Nama Pembeli, Harga Jual, DPP Nilai Lain, dan PPN tiap faktur, dibulatkan ke rupiah seperti di daftar faktur Coretax, dengan ✓ kalau sama dengan invoice. Rekap bisa disalin untuk ditempel di Excel. Sebelum download, isi file XML dibaca ulang dan dicocokkan dengan rekap ini serta dengan format Coretax; kalau ada yang tidak sesuai, download dikunci.
+5. Download XML, lalu impor di Coretax. Cocokkan daftar faktur di Coretax dengan rekap lewat nomor Referensi. Nama pembeli di Coretax diisi dari NPWP di data master, jadi nama yang berbeda berarti NPWP pelanggan itu perlu dicek. Rekap setiap XML tersimpan di **Riwayat** (di data master, jadi terlihat dari semua perangkat) dan bisa disalin ke Excel.
+6. Invoice yang sudah pernah dibuatkan XML tertahan sampai dipilih: **Hapus dari daftar** atau **Tetap buat lagi**, supaya faktur tidak terbit dua kali di Coretax. Download ulang file yang baru saja dibuat cukup dengan konfirmasi.
+7. Setelah faktur terbit, pilih PDF faktur dari Coretax (bisa bersama invoicenya). Aplikasi mencocokkannya lewat nomor Referensi: NPWP dan NITKU pembeli, tiap baris barang, dan total. Kalau invoicenya sudah tidak di daftar, yang dicocokkan total dari Riwayat. Nomor versi aplikasi ada di Data master → Pengaturan.
 
 ## Data
 
