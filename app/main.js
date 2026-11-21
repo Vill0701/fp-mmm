@@ -691,7 +691,8 @@ function invoiceCard(invoice, f) {
   const errors = f.checks.filter((c) => c.level === "error").length;
   const warnings = f.checks.filter((c) => c.level === "warn").length;
   const [level, label] = statusOf(f);
-  const incomplete = f.lines.filter((l) => !isCode(l.code) || !isUnit(l.unit)).length;
+  const unread = f.lines.filter((l) => l.incomplete).length; // tidak bisa jadi baris faktur: hapus kalau bukan barang
+  const incomplete = f.lines.filter((l) => !l.incomplete && (!isCode(l.code) || !isUnit(l.unit))).length;
   const key = `card:${f.number}`;
   const open = state.open[key] ?? level !== "ok";
   const header = h(
@@ -717,8 +718,15 @@ function invoiceCard(invoice, f) {
     buyerBlock(invoice, f),
     details(`checks:${f.number}`, errors + warnings > 0, `Pemeriksaan (${f.checks.length})`,
       h("ul", { class: "checks" }, f.checks.map((c) => h("li", { class: c.level }, c.message)))),
-    details(`lines:${f.number}`, incomplete > 0, `${f.lines.length} baris barang${incomplete ? ` · ${incomplete} belum lengkap` : ""}`,
-      f.lines.map((line, i) => lineRow(line, i))),
+    details(`lines:${f.number}`, incomplete + unread > 0 || f.flags.lines.length > 0,
+      [
+        `${f.lines.length} baris barang`,
+        f.removed.length && `${f.removed.length} dihapus`,
+        unread && `${unread} tidak bisa dipakai`,
+        incomplete && `${incomplete} belum lengkap`,
+      ].filter(Boolean).join(" · "),
+      f.lines.map((line) => lineRow(invoice, f, line))),
+    removedBlock(invoice),
     h(
       "dl",
       { class: "totals" },
@@ -726,6 +734,40 @@ function invoiceCard(invoice, f) {
       h("dt", {}, "DPP Nilai Lain"), h("dd", {}, num(f.totals.otherTaxBaseSen)),
       h("dt", {}, "PPN"), h("dd", {}, num(f.totals.vatSen)),
     ),
+  );
+}
+
+/** Hapus satu baris barang (urutan `pos`) dari faktur, mis. catatan yang terbaca sebagai barang; bisa dikembalikan. */
+function removeLine(invoice, pos) {
+  invoice.removed = [...new Set([...(invoice.removed ?? []), pos])].sort((a, b) => a - b);
+  state.open[`card:${invoice.number}`] = true; // kartu tetap terbuka walau sekarang sudah siap
+  render();
+  toast(`Baris ${pos} dihapus dari faktur ${invoice.number}. Bisa dikembalikan di kartunya.`);
+}
+
+function restoreLine(invoice, pos) {
+  invoice.removed = (invoice.removed ?? []).filter((x) => x !== pos);
+  state.open[`card:${invoice.number}`] = true;
+  render();
+}
+
+/** Baris yang dihapus dari faktur, dengan tombol untuk mengembalikannya. */
+function removedBlock(invoice) {
+  if (!invoice.removed?.length) return null;
+  return h(
+    "div",
+    { class: "removed-lines" },
+    h("strong", {}, "Dihapus dari faktur"),
+    invoice.removed.map((pos) => {
+      const l = invoice.lines[pos - 1];
+      return h(
+        "div",
+        {},
+        h("span", { class: "no" }, pos),
+        h("span", {}, l?.name || "(tanpa nama)", l?.total != null ? ` · ${num(Math.round(l.total * 100))}` : ""),
+        h("button", { type: "button", class: "link", onclick: () => restoreLine(invoice, pos) }, "Kembalikan"),
+      );
+    }),
   );
 }
 
@@ -831,20 +873,40 @@ function useExistingCustomer(invoiceName, existingName) {
   render();
 }
 
-function lineRow(line, i) {
+/**
+ * Satu baris faktur. Baris yang tidak bisa dipakai (angkanya tidak terbaca, tanpa nama, atau berisi label LUNAS)
+ * ditandai dan punya tombol hapus yang jelas; baris lain bisa dihapus lewat tombol kecil. Baris biaya kirim
+ * bukan baris invoice (tanpa `pos`), jadi tidak bisa dihapus.
+ */
+function lineRow(invoice, f, line) {
   const complete = isCode(line.code) && isUnit(line.unit);
+  const bad = line.pos != null && f.flags.lines.includes(line.pos - 1);
   return h(
     "div",
-    { class: `line${complete ? "" : " missing"}` },
-    h("div", { class: "line-name" }, h("span", { class: "no" }, i + 1), h("span", {}, line.name)),
+    { class: `line${complete ? "" : " missing"}${bad ? " bad" : ""}` },
     h(
+      "div",
+      { class: "line-name" },
+      h("span", { class: "no" }, line.pos ?? ""),
+      h("span", {}, line.name || h("em", { class: "muted" }, "(tanpa nama)")),
+      line.pos != null && h("button", {
+        type: "button",
+        class: line.incomplete ? "danger small line-remove" : "link line-remove",
+        title: "Hapus baris ini dari faktur",
+        "aria-label": `Hapus baris ${line.pos} dari faktur`,
+        onclick: () => removeLine(invoice, line.pos),
+      }, line.incomplete ? "Hapus baris ini" : "Hapus"),
+    ),
+    line.issues.length > 0 && h("p", { class: "line-issue" }, line.issues.join("; "), line.incomplete ? ". Kalau ini bukan barang, hapus baris ini." : ""),
+    // Baris yang tidak bisa dipakai belum bisa dihitung atau diberi kode; pilihannya hanya dihapus.
+    !line.incomplete && h(
       "div",
       { class: "line-calc" },
       `${qtyText(line.qty)} ${line.invoiceUnit} × ${num(line.priceSen)}`,
       line.discountSen ? ` − diskon ${num(line.discountSen)}` : "",
       ` = DPP ${num(line.taxBaseSen)} · PPN ${num(line.vatSen)}`,
     ),
-    h(
+    !line.incomplete && h(
       "div",
       { class: "line-inputs" },
       h("input", {
@@ -940,7 +1002,9 @@ async function renderPdfPages(invoice, box, flags) {
       const viewport = page.getViewport({ scale: (width / base.width) * Math.min(4, 2 * (devicePixelRatio || 1)) });
       const canvas = h("canvas", { width: Math.ceil(viewport.width), height: Math.ceil(viewport.height), role: "img", "aria-label": `Halaman ${number}` });
       await page.render({ canvas, viewport }).promise;
-      out.push(h("div", { class: "pdf-page" }, canvas, (invoice.marks ?? []).filter((m) => m.page === number).map((m) => markEl({ ...m, bad: isBad(m, flags) }, base))));
+      const removed = new Set(invoice.removed ?? []);
+      out.push(h("div", { class: "pdf-page" }, canvas, (invoice.marks ?? []).filter((m) => m.page === number).map((m) =>
+        markEl({ ...m, bad: isBad(m, flags), removed: m.kind === "line" && removed.has(Number(m.label)) }, base))));
     }
     box.replaceChildren(...out);
   } finally {
@@ -951,7 +1015,7 @@ async function renderPdfPages(invoice, box, flags) {
 /** Tanda di atas halaman, dalam persen ukuran halaman supaya ikut membesar saat diperbesar. */
 function markEl(m, base) {
   const pad = 1.5; // pt
-  const el = h("div", { class: `pdf-mark${m.bad ? " bad" : ""}` }, m.label && h("span", {}, m.label));
+  const el = h("div", { class: `pdf-mark${m.removed ? " removed" : m.bad ? " bad" : ""}` }, m.label && h("span", {}, m.label));
   Object.assign(el.style, {
     left: `${((m.x0 - pad) / base.width) * 100}%`,
     top: `${((m.top - pad / 2) / base.height) * 100}%`,
@@ -970,12 +1034,14 @@ function readPanel(invoice, f) {
   const flags = f.flags;
   const bad = (group, key) => (flags[group].includes(key) ? "bad" : null);
   const flagged = flags.lines.length + flags.summary.length + flags.header.length > 0;
+  const removed = new Set(invoice.removed ?? []);
   return h(
     "section",
     { class: "pdf-read" },
     h("h3", {}, "Yang dibaca aplikasi"),
     h("p", { class: "muted" }, "Bagian PDF yang dibaca diberi tanda kuning; nomor baris barang sama dengan tabel di bawah. Kalau ada baris di PDF yang tidak bertanda, baris itu tidak terbaca."),
     flagged && h("p", { class: "bad-note" }, "Tanda merah = bagian yang bermasalah menurut Pemeriksaan di kartu invoice."),
+    removed.size > 0 && h("p", { class: "muted" }, "Tanda abu-abu = baris yang dihapus dari faktur."),
     h(
       "dl",
       { class: "read-head" },
@@ -1001,10 +1067,10 @@ function readPanel(invoice, f) {
           invoice.lines.map((l, i) =>
             h(
               "tr",
-              { class: bad("lines", i) },
+              { class: removed.has(i + 1) ? "removed" : bad("lines", i) },
               h("td", {}, h("span", { class: "line-no" }, i + 1)),
               h("td", { class: "mono" }, l.code || "–"),
-              h("td", {}, l.name),
+              h("td", {}, l.name, removed.has(i + 1) && h("small", { class: "removed-tag" }, "dihapus dari faktur")),
               h("td", { class: "num" }, n(l.qty)),
               h("td", { class: "num" }, l.unit || "–"),
               h("td", { class: "num" }, n(l.price)),
@@ -1133,7 +1199,8 @@ const RECAP_AMOUNTS = [
 function recapRow(f) {
   const { discountSen, taxBaseSen, otherTaxBaseSen, vatSen } = f.totals;
   const [level, label] = statusOf(f);
-  return { number: f.number, date: f.date, buyerName: f.buyerName, discountSen, taxBaseSen, otherTaxBaseSen, vatSen, compared: f.compared, level, label };
+  const removed = f.removed.length ? `${f.removed.length} baris dihapus` : null;
+  return { number: f.number, date: f.date, buyerName: f.buyerName, discountSen, taxBaseSen, otherTaxBaseSen, vatSen, compared: f.compared, level, label, removed };
 }
 
 /** Jumlah per kolom dari angka yang sudah dibulatkan per faktur, seperti total daftar faktur di Coretax. */
@@ -1176,6 +1243,7 @@ function recapTable(rows, { onPick } = {}) {
               onPick ? h("button", { type: "button", class: "link", onclick: () => onPick(r.number) }, r.number) : h("strong", {}, r.number),
               h("small", {}, dateText(r.date)),
               r.level && r.level !== "ok" ? h("small", { class: `status ${r.level}` }, r.label) : null,
+              r.removed ? h("small", {}, r.removed) : null,
             ),
             h("td", { class: "name" }, r.buyerName || "–"),
             RECAP_AMOUNTS.map((col) => amountCell(r, col)),

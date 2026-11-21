@@ -36,6 +36,13 @@ export function parseDate(str) {
 
 const sameLine = (a, b) => Math.abs(a.y - b.y) <= TOL;
 
+/**
+ * Label status pembayaran yang kadang ditulis di invoice, mis. "LUNAS", "Belum Lunas", "L U N A S", atau
+ * "LUNAS 19/11/2026". Kalau jatuh di area tabel, label itu bukan barang.
+ */
+const STAMP = /^[^A-Z]*((SUDAH|BELUM)[\s]*)?L[\s]*U[\s]*N[\s]*A[\s]*S(?![A-Z])[^A-Z]*$/i;
+export const isStamp = (text) => STAMP.test(String(text ?? "").trim());
+
 const DEFAULT_H = 8; // tinggi huruf (pt) kalau tidak diketahui
 
 /**
@@ -98,7 +105,7 @@ function columnOf(it, cols) {
   return null;
 }
 
-function makeRow(cells, warnings) {
+function makeRow(cells) {
   const row = {
     no: Number(cells.no),
     code: cells.code ?? "",
@@ -109,13 +116,18 @@ function makeRow(cells, warnings) {
     disc: cells.disc ?? "",
     total: parseNumber(cells.total ?? ""),
   };
+  // Masalah per baris dicatat di barisnya, supaya hilang kalau baris itu dihapus dari faktur
+  const issues = [];
   for (const [key, label] of [["qty", "Qty"], ["price", "@Harga"], ["total", "Total Harga"]]) {
-    if (row[key] == null) warnings.push(`baris ${row.no}: kolom ${label} tidak terbaca ("${cells[key] ?? ""}")`);
+    if (row[key] != null) continue;
+    const raw = (cells[key] ?? "").trim();
+    issues.push(raw ? `${label} berisi "${raw}", bukan angka` : `${label} kosong`);
   }
+  if (issues.length) row.issues = issues;
   return row;
 }
 
-function parseRows(items, header, bottomY, warnings) {
+function parseRows(items, header, bottomY, warnings, notes) {
   const body = items
     .filter((it) => it.y > header.y + TOL && it.y < bottomY - TOL)
     .sort((a, b) => a.y - b.y || a.x - b.x);
@@ -128,10 +140,24 @@ function parseRows(items, header, bottomY, warnings) {
     else lines.push({ y: it.y, items: [it] });
   }
 
+  const stamps = new Set(); // tulisan LUNAS yang diabaikan
   const rows = [];
   for (const line of lines) {
+    // Tulisan LUNAS di luar baris bernomor, atau di luar kolom, bukan bagian barang: tidak disambung ke nama barang
+    // di atasnya. Yang tertulis di kolom baris bernomor tetap dibaca, supaya kelihatan di baris itu dan bisa dihapus.
+    const numbered = line.items.some((it) => columnOf(it, header.cols) === "no" && /^\d+$/.test(it.str));
+    const kept = line.items.filter((it) => {
+      if (!isStamp(it.str) || (numbered && columnOf(it, header.cols))) return true;
+      stamps.add(it.str.trim());
+      return false;
+    });
+    // Label yang hurufnya terpisah-pisah ("L U N A S")
+    if (!numbered && kept.length > 1 && isStamp(kept.map((it) => it.str).join(""))) {
+      stamps.add(kept.map((it) => it.str).join(" "));
+      continue;
+    }
     const cells = {};
-    for (const it of line.items) {
+    for (const it of kept) {
       const col = columnOf(it, header.cols);
       if (!col) {
         warnings.push(`teks di luar kolom tabel: "${it.str}"`);
@@ -140,11 +166,12 @@ function parseRows(items, header, bottomY, warnings) {
       cells[col] = cells[col] ? `${cells[col]} ${it.str}` : it.str;
     }
     const filled = Object.keys(cells);
-    const box = boxOf(...line.items);
-    if (/^\d+$/.test(cells.no ?? "")) rows.push({ ...makeRow(cells, warnings), box });
+    const box = boxOf(...kept);
+    if (/^\d+$/.test(cells.no ?? "")) rows.push({ ...makeRow(cells), box });
     else if (filled.length === 1 && cells.name) rows.push({ continuation: cells.name, box });
-    else if (filled.length) warnings.push(`baris tabel tidak dikenali: "${line.items.map((it) => it.str).join(" ")}"`);
+    else if (filled.length) warnings.push(`baris tabel tidak dikenali: "${kept.map((it) => it.str).join(" ")}"`);
   }
+  if (stamps.size) notes.push(`tulisan ${[...stamps].map((s) => `"${s}"`).join(", ")} di tabel diabaikan: itu label, bukan barang`);
   return rows;
 }
 
@@ -168,6 +195,7 @@ function parsePage(page) {
   const { items } = page;
   const find = (text) => items.find((it) => it.str === text) ?? null;
   const warnings = [];
+  const notes = []; // info, bukan masalah (mis. label LUNAS yang diabaikan)
   const header = findTableHeader(items);
   const rightBlockX = find("SALES INVOICE")?.x ?? Infinity; // blok Kepada/Kontak ada di kiri blok ini
 
@@ -223,11 +251,12 @@ function parsePage(page) {
     poNumber,
     page: pageInfo ? { index: Number(pageInfo[1]), of: Number(pageInfo[2]) } : null,
     pdfPage: page.number, // nomor halaman di file PDF (beda dengan "Halaman X dari Y" yang tercetak)
-    rows: header ? parseRows(items, header, summaryTop, warnings) : [],
+    rows: header ? parseRows(items, header, summaryTop, warnings, notes) : [],
     summary: parseSummary(items, summaryMarks),
     marks,
     summaryMarks,
     warnings,
+    notes,
   };
 }
 
@@ -267,6 +296,7 @@ export function parseInvoices(pages) {
       lines: [],
       summary: null,
       warnings: [],
+      notes: [],
       marks,
     };
     for (const part of parts) {
@@ -292,8 +322,14 @@ export function parseInvoices(pages) {
         for (const [key, box] of Object.entries(part.summaryMarks)) mark(part.pdfPage, "summary", box, { key });
       }
       invoice.warnings.push(...part.warnings.map((w) => `${where}: ${w}`));
+      invoice.notes.push(...part.notes.map((n) => `${where}: ${n}`));
     }
-    for (const line of invoice.lines) line.name = line.name.replace(/\s+/g, " ").trim();
+    for (const line of invoice.lines) {
+      line.name = line.name.replace(/\s+/g, " ").trim();
+      // Baris bernomor yang isinya label LUNAS atau tanpa nama tidak bisa jadi baris faktur (lihat calc.js)
+      const issue = isStamp(line.name) ? "nama barangnya label, bukan barang" : !line.name ? "Nama Barang kosong" : null;
+      if (issue) line.issues = [...(line.issues ?? []), issue];
+    }
     invoices.push(invoice);
   }
   return { invoices, warnings };

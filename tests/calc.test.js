@@ -219,3 +219,47 @@ test("faktur Coretax dicocokkan dengan faktur buatan aplikasi (daftar dan Riwaya
   // NPWP pembeli yang berbeda tertangkap
   assert.deepEqual(compareCoretax({ ...c, goods: coretaxOf(f).goods, buyerNpwp: "3".repeat(16) }, { npwp: f.customer.npwp, totals: f.totals }).filter((r) => !r.ok).map((r) => r.label), ["NPWP pembeli"]);
 });
+
+test("baris yang tidak bisa dipakai menahan faktur; setelah dihapus faktur siap dan XML hanya berisi barang asli", () => {
+  const base = invoice([["A1", 2, "PCS", 100000], ["B2", 1, "KLG", 50000]], { subTotal: 250000, ppn: 27500, total: 277500 });
+  // Baris 3: label LUNAS yang ditulis sebagai baris bernomor, tanpa angka
+  const label = { no: 3, code: "", name: "LUNAS", qty: null, unit: "", price: null, disc: "", total: null, issues: ["Qty kosong", "@Harga kosong", "Total Harga kosong", "nama barangnya label, bukan barang"] };
+  const inv = { ...base, lines: [...base.lines, label] };
+  const f = computeFaktur(inv, master);
+  assert.equal(f.ready, false);
+  assert.deepEqual(problems(f), ['Baris 3 "LUNAS" tidak terbaca lengkap (Qty kosong; @Harga kosong; Total Harga kosong; nama barangnya label, bukan barang). Kalau ini bukan barang, hapus baris ini.']);
+  assert.deepEqual(f.flags.lines, [2]);
+  assert.deepEqual(f.lines.map((l) => [l.pos, l.incomplete]), [[1, false], [2, false], [3, true]]);
+  assert.deepEqual(f.removed, []);
+
+  // Label dengan angka nol pun tetap ditahan, karena bukan barang
+  const zero = computeFaktur({ ...base, lines: [...base.lines, { ...label, qty: 0, price: 0, total: 0, issues: ["nama barangnya label, bukan barang"] }] }, master);
+  assert.deepEqual(problems(zero), ['Baris 3 "LUNAS" tidak bisa masuk faktur (nama barangnya label, bukan barang). Kalau ini bukan barang, hapus baris ini.']);
+
+  // Dihapus (menurut urutan baris): faktur siap, baris faktur tetap bernomor seperti di invoice
+  const g = computeFaktur({ ...inv, removed: [3] }, master);
+  assert.deepEqual(problems(g), []);
+  assert.deepEqual(g.lines.map((l) => l.pos), [1, 2]);
+  assert.deepEqual(g.removed, [3]);
+  assert.ok(g.checks.some((c) => c.level === "info" && c.message === 'Baris 3 "LUNAS" dihapus dari faktur atas pilihanmu'));
+  const seller = { tin: NPWP, idtku: NPWP + "000000" };
+  const xml = buildXml(seller, [g]);
+  assert.equal(xml.match(/<GoodService>/g).length, 2);
+  assert.ok(!xml.includes("LUNAS"));
+  assert.deepEqual(verifyXml(xml, seller, [g]), []);
+
+  // Yang terhapus ternyata barang asli: ketahuan karena jumlah baris tidak lagi sama dengan Sub Total
+  const h = computeFaktur({ ...inv, removed: [1, 3] }, master);
+  assert.equal(h.ready, false);
+  assert.ok(problems(h).some((m) => /tidak sama dengan Sub Total/.test(m)));
+
+  // Nomor tercetak kembar: yang dihapus hanya baris di urutan itu
+  const twin = computeFaktur({ ...base, lines: [base.lines[0], base.lines[1], { ...label, no: 2 }], removed: [3] }, master);
+  assert.deepEqual(twin.lines.map((l) => [l.pos, l.no]), [[1, 1], [2, 2]]);
+
+  // Catatan label LUNAS dari pembaca PDF hanya info; biaya kirim tidak punya urutan baris, jadi tidak bisa dihapus
+  const n = computeFaktur({ ...invoice([["A1", 1, "PCS", 100000]], { subTotal: 100000, shipping: 10000, ppn: 11000, total: 121000 }), notes: ['Hal. 1: tulisan "LUNAS" di tabel diabaikan: itu label, bukan barang'] }, master);
+  assert.ok(n.ready);
+  assert.ok(n.checks.some((c) => c.level === "info" && /LUNAS/.test(c.message)));
+  assert.deepEqual(n.lines.map((l) => l.pos), [1, undefined]);
+});
